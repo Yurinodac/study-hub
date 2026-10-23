@@ -1,0 +1,75 @@
+{
+  "name": "study-hub",
+  "version": "1.0.0",
+  "description": "Study Hub — a calm Windows desktop study tracker",
+  "main": "out/main/index.js",
+  "author": "MCATaid",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "dev": "npm run rebuild:electron && npm run verify:native && npx electron-vite dev",
+    "build": "npx electron-vite build",
+    "preview": "npx electron-vite preview",
+    "rebuild:electron": "npx electron-rebuild -f -w better-sqlite3",
+    "verify:native": "node scripts/verify-electron-native.cjs",
+    "dist": "npm run build && npm run rebuild:electron && npm run verify:native && npx electron-builder --win",
+    "dist:dir": "npm run build && npm run rebuild:electron && npm run verify:native && npx electron-builder --win --dir",
+    "test": "npm rebuild better-sqlite3 && npx vitest run && npm run rebuild:electron",
+    "typecheck": "npx tsc --noEmit -p tsconfig.web.json && npx tsc --noEmit -p tsconfig.node.json",
+    "postinstall": "npm run rebuild:electron"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.7.2",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^34.2.0",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^3.0.0",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0",
+    "vitest": "^3.0.5"
+  },
+  "build": {
+    "appId": "com.mcataid.studyhub",
+    "productName": "Study Hub",
+    "npmRebuild": false,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "**/*.node",
+      "**/better-sqlite3/**/*",
+      "**/bindings/**/*",
+      "**/file-uri-to-path/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "StudyHub-Setup-${version}.${ext}",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "Study Hub"
+    }
+  }
+}
