@@ -5,7 +5,8 @@ export type ResourceType =
   | 'question_bank'
   | 'custom'
 
-export type LocationKind = 'url' | 'file' | 'none'
+/** url / file / app (Windows .exe) / none */
+export type LocationKind = 'url' | 'file' | 'app' | 'none'
 
 export type ProjectPreset = 'mcat' | 'custom'
 
@@ -32,8 +33,14 @@ export type StudyArea = Category
 export interface TextbookConfig {
   trackChapters: boolean
   trackPages: boolean
+  /** Where you are now (session / stopping point) — not aggregate completion. */
   currentChapter?: string
   currentPage?: number
+  /**
+   * Optional expected chapter count for the Overview bar when not every chapter is listed yet.
+   * Aggregate completed count comes from the Chapters tab (marked done), not this field.
+   */
+  totalChapters?: number | null
   totalPages?: number | null
 }
 
@@ -46,21 +53,44 @@ export interface VideoConfig {
 
 export interface AnkiConfig {
   reviewSessionsThisWeek?: number
+  /** Optional weekly session goal — activity note only (not the progress bar). */
+  weeklySessionGoal?: number | null
   lastSessionMinutes?: number
   lastNewCards?: number
+  /**
+   * Cumulative cards attempted (Overview / progress bar).
+   * Progress tab session values are added onto these totals on save.
+   */
+  cardsAttempted?: number
+  /** Cumulative cards correct — bar uses correct ÷ attempted. */
+  cardsCorrect?: number
   note?: string
 }
 
 export interface QuestionBankConfig {
+  /**
+   * Cumulative questions attempted (Overview / progress bar).
+   * Progress tab session values are added onto these totals on save.
+   */
   questionsAttempted?: number
+  /** Total questions in the bank/set when known — activity note only (bar uses correct ÷ attempted). */
+  totalQuestions?: number | null
+  /** Cumulative correct answers — bar uses correct ÷ attempted. */
   correctAnswers?: number | null
+  /** Optional cumulative incorrect; if omitted, derived as max(0, attempted - correct). */
+  incorrectAnswers?: number | null
   nextActionHint?: string
 }
 
 export interface CustomConfig {
   mode: 'checklist' | 'units' | 'time' | 'milestones'
   unitLabel?: string
+  /**
+   * Cumulative completed units (Overview / progress bar).
+   * Progress tab session values are added onto this total on save.
+   */
   completedUnits?: number
+  /** Expected total units — enables done÷total progress bar. Set on Overview (or when adding). */
   totalUnits?: number | null
   timeSpentMinutes?: number
   checklist?: Array<{ id: string; label: string; done: boolean }>
@@ -118,6 +148,8 @@ export interface StudyHistoryPayload {
   studyAreaNames?: string[]
   sectionId?: string
   sectionName?: string
+  sectionIds?: string[]
+  sectionNames?: string[]
   details?: string
   [key: string]: unknown
 }
@@ -127,6 +159,8 @@ export type HistoryExtras = {
   details?: string
   studyAreaIds?: string[]
   sectionId?: string
+  /** Multiple Chapters-tab rows linked in one Progress save (reading / checklist). */
+  sectionIds?: string[]
 }
 
 export interface StudyHistoryEntry {
@@ -155,6 +189,9 @@ export interface QueueItem {
 
 export type PracticeReviewStatus = 'not_reviewed' | 'in_progress' | 'reviewed'
 
+/** Official exam section codes for missed-question logging. */
+export type ExamSectionCode = 'C/P' | 'CARS' | 'B/B' | 'P/S'
+
 export interface PracticeExam {
   id: string
   projectId: string
@@ -171,6 +208,21 @@ export interface PracticeExam {
   updatedAt: string
 }
 
+/** Missed question logged under a practice exam section (flashcard review). */
+export interface MissedQuestion {
+  id: string
+  examId: string
+  sectionCode: ExamSectionCode
+  prompt: string
+  correctAnswer: string
+  commentary: string
+  /** 1 (shaky) … 5 (solid) — confidence for flashcard review, not a mastery claim. */
+  confidence: number
+  inRotation: boolean
+  createdAt: string
+  updatedAt: string
+}
+
 export interface ResourceCard extends Resource {
   projectName: string
   studyAreaName: string | null
@@ -178,6 +230,8 @@ export interface ResourceCard extends Resource {
   /** Alias of studyAreaNames for UI. */
   categoryNames: string[]
   progressSummary: string
+  /** Chapter/section completion when units are set on sections. */
+  sectionProgress?: { done: number; total: number } | null
 }
 
 export interface BackupPayload {
@@ -192,6 +246,7 @@ export interface BackupPayload {
   history: StudyHistoryEntry[]
   queue: QueueItem[]
   practiceExams?: PracticeExam[]
+  missedQuestions?: MissedQuestion[]
 }
 
 export interface OpenResourceResult {
@@ -200,7 +255,13 @@ export interface OpenResourceResult {
   needsUpdateLocation?: boolean
 }
 
-export const SCHEMA_VERSION = 4
+export interface CelebrationSettings {
+  /** Absolute path under userData, or empty for default/message-only. */
+  imagePath: string
+  hasCustomImage: boolean
+}
+
+export const SCHEMA_VERSION = 5
 
 export const RESOURCE_TYPE_LABELS: Record<ResourceType, string> = {
   textbook: 'Textbook / reading',
@@ -215,3 +276,5 @@ export const PRACTICE_REVIEW_LABELS: Record<PracticeReviewStatus, string> = {
   in_progress: 'Review in progress',
   reviewed: 'Reviewed'
 }
+
+export const EXAM_SECTION_CODES: ExamSectionCode[] = ['C/P', 'CARS', 'B/B', 'P/S']

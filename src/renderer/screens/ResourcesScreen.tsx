@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import type { Category, ProjectPreset, Resource, ResourceCard, ResourceType } from '../../shared/types'
 import { RESOURCE_TYPE_LABELS } from '../../shared/types'
-import { completionPercent } from '../../shared/progress'
 import AddResourceDialog from '../components/AddResourceDialog'
+import CompletionBar from '../components/CompletionBar'
 
 function useDebounced<T>(value: T, ms: number): T {
   const [debounced, setDebounced] = useState(value)
@@ -87,8 +87,8 @@ export default function ResourcesScreen({
           <div>
             <h2>My Resources</h2>
             <p>
-              Tap a card for details. <strong>Open resource</strong> opens the file or site;{' '}
-              <strong>Update progress</strong> goes straight to the progress form.
+              Tap a card for details. <strong>Open resource</strong> opens the file, site, or app;{' '}
+              <strong>Update progress</strong> goes to the progress form (where you can schedule the next action).
             </p>
           </div>
           <button type="button" className="btn btn-primary" onClick={() => setShowAdd(true)}>
@@ -102,7 +102,7 @@ export default function ResourcesScreen({
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Name, stopping point, next action"
+              placeholder="Name, stopping point"
               autoComplete="off"
               name="resources-search"
             />
@@ -295,11 +295,11 @@ export default function ResourcesScreen({
         ) : (
           <div className="resource-list">
             {resources.map((r) => {
-              const pct = completionPercent(r)
               const showProgress = hasUsefulProgress(r.progressSummary)
               const showStopping = Boolean(r.stoppingPointNote?.trim())
-              const showNext = Boolean(r.nextAction?.trim())
               const showLast = Boolean(r.lastStudiedAt)
+              const openLabel =
+                r.type === 'anki' && r.locationKind === 'app' ? 'Open Anki app' : 'Open resource'
               return (
                 <div key={r.id} className="resource-card" style={{ cursor: 'default' }}>
                   <button
@@ -320,6 +320,7 @@ export default function ResourcesScreen({
                       )}
                     </div>
                     <h3>{r.name}</h3>
+                    <CompletionBar resource={r} sectionProgress={r.sectionProgress} />
                     {showProgress && (
                       <p className="meta">
                         <strong>Progress:</strong> {r.progressSummary}
@@ -330,20 +331,10 @@ export default function ResourcesScreen({
                         <strong>Stopping point:</strong> {r.stoppingPointNote}
                       </p>
                     )}
-                    {showNext && (
-                      <p className="meta">
-                        <strong>Next action:</strong> {r.nextAction}
-                      </p>
-                    )}
                     {showLast && (
                       <p className="meta">
                         <strong>Last studied:</strong> {new Date(r.lastStudiedAt!).toLocaleString()}
                       </p>
-                    )}
-                    {pct != null && (
-                      <div className="progress-meter" aria-hidden="true">
-                        <span style={{ width: `${pct}%` }} />
-                      </div>
                     )}
                   </button>
                   <div className="btn-row" style={{ marginTop: '0.75rem' }}>
@@ -352,7 +343,7 @@ export default function ResourcesScreen({
                       className="btn btn-primary"
                       onClick={() => void onOpenResource(r)}
                     >
-                      Open resource
+                      {openLabel}
                     </button>
                     <button type="button" className="btn btn-secondary" onClick={() => onUpdateProgress(r.id)}>
                       Update progress

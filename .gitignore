@@ -1,12 +1,36 @@
-node_modules
-out
-dist
-release
-*.log
-.DS_Store
-coverage
-.vscode
-.idea
+# Dependencies & build output
+node_modules/
+out/
+dist/
+release/
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+
+# Local databases
 *.sqlite
 *.sqlite-*
+*.db
+*.db-*
+
+# Logs & coverage
+*.log
+npm-debug.log*
+coverage/
+
+# TypeScript incremental
 *.tsbuildinfo
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~

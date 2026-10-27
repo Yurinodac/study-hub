@@ -6,6 +6,8 @@ import {
   SCHEMA_VERSION,
   type BackupPayload,
   type Category,
+  type ExamSectionCode,
+  type MissedQuestion,
   type PracticeExam,
   type PracticeReviewStatus,
   type Project,
@@ -17,9 +19,15 @@ import {
   type ResourceSection,
   type ResourceType,
   type StudyArea,
-  type StudyHistoryEntry
+  type StudyHistoryEntry,
+  type TextbookConfig
 } from '../shared/types'
-import { progressFromQueueCompletion, summarizeProgress } from '../shared/progress'
+import {
+  chapterCompletionFromSections,
+  progressFromQueueCompletion,
+  summarizeProgress
+} from '../shared/progress'
+import { eachDateInclusive } from '../shared/dates'
 import {
   MCAT_CATEGORY_NAMES,
   clampPracticeScore,
@@ -205,7 +213,40 @@ function migrate(database: SqlDb): void {
       }
       database.prepare('UPDATE meta SET value = ? WHERE key = ?').run('4', 'schemaVersion')
     }
+    if (current < 5) {
+      database.exec(`
+        CREATE TABLE IF NOT EXISTS practice_missed_questions (
+          id TEXT PRIMARY KEY,
+          exam_id TEXT NOT NULL REFERENCES practice_exams(id) ON DELETE CASCADE,
+          section_code TEXT NOT NULL,
+          prompt TEXT NOT NULL,
+          correct_answer TEXT NOT NULL DEFAULT '',
+          commentary TEXT NOT NULL DEFAULT '',
+          confidence INTEGER NOT NULL DEFAULT 1,
+          in_rotation INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+      `)
+      database.prepare('UPDATE meta SET value = ? WHERE key = ?').run('5', 'schemaVersion')
+    }
   }
+
+  // Idempotent: ensure missed-questions table exists even if schema bump was skipped.
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS practice_missed_questions (
+      id TEXT PRIMARY KEY,
+      exam_id TEXT NOT NULL REFERENCES practice_exams(id) ON DELETE CASCADE,
+      section_code TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      correct_answer TEXT NOT NULL DEFAULT '',
+      commentary TEXT NOT NULL DEFAULT '',
+      confidence INTEGER NOT NULL DEFAULT 1,
+      in_rotation INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `)
 }
 
 function ensureColumn(database: SqlDb, table: string, column: string, type: string): void {
@@ -505,15 +546,31 @@ export function listResources(projectId: string, opts?: {
   return rows.map((row) => {
     const resource = mapResource(row)
     const names = getResourceAreaNames(resource.id)
+    const sectionProgress = getSectionProgress(resource.id)
     return {
       ...resource,
       projectName: String(row.project_name),
       studyAreaName: names[0] ?? (row.study_area_name ? String(row.study_area_name) : null),
       studyAreaNames: names,
       categoryNames: names,
-      progressSummary: summarizeProgress(resource)
+      sectionProgress,
+      progressSummary: summarizeProgress(resource, sectionProgress)
     }
   })
+}
+
+/**
+ * Chapter completion for Overview / cards: count of chapters marked done on the Chapters tab
+ * vs optional totalChapters (or listed chapter count).
+ */
+export function getSectionProgress(resourceId: string): { done: number; total: number } | null {
+  const sections = listSections(resourceId)
+  const resource = getResource(resourceId)
+  const totalChapters =
+    resource?.type === 'textbook'
+      ? (resource.config as TextbookConfig).totalChapters
+      : null
+  return chapterCompletionFromSections(sections, totalChapters)
 }
 
 export function getResource(id: string): Resource | null {
@@ -678,37 +735,31 @@ export function updateResource(
           )
           .all(...areaIds) as Array<{ name: string }>).map((r) => r.name)
       : []
-    let sectionId = historyExtras?.sectionId
-    let sectionName: string | undefined
-    if (sectionId) {
-      const section = listSections(id).find((s) => s.id === sectionId)
-      if (section) {
-        sectionName = section.name
-        // Touch chapter progress so subject work stays connected to the section.
-        if (section.completedUnits <= 0) {
-          upsertSection({
-            id: section.id,
-            resourceId: id,
-            name: section.name,
-            studyAreaId: section.studyAreaId,
-            completedUnits: Math.max(1, section.completedUnits),
-            totalUnits: section.totalUnits
-          })
-        }
-      } else {
-        sectionId = undefined
-      }
-    }
+    const allSections = listSections(id)
+    const linkedIds = [
+      ...(historyExtras?.sectionIds ?? []),
+      ...(historyExtras?.sectionId ? [historyExtras.sectionId] : [])
+    ].filter((sid, i, arr) => sid && arr.indexOf(sid) === i)
+    const linked = linkedIds
+      .map((sid) => allSections.find((s) => s.id === sid))
+      .filter((s): s is NonNullable<typeof s> => Boolean(s))
+    const sectionId = linked[0]?.id
+    const sectionName = linked[0]?.name
+    const sectionNames = linked.map((s) => s.name)
     addHistory(id, historySummary, {
       config: next.config,
       stoppingPointNote: next.stoppingPointNote,
       nextAction: next.nextAction,
-      studiedPart: historyExtras?.studiedPart ?? sectionName,
+      studiedPart:
+        historyExtras?.studiedPart ??
+        (sectionNames.length ? sectionNames.join(', ') : undefined),
       details: historyExtras?.details,
       studyAreaIds: areaIds,
       studyAreaNames: areaNames,
       sectionId,
-      sectionName
+      sectionName,
+      sectionIds: linked.map((s) => s.id),
+      sectionNames
     })
   }
 
@@ -839,7 +890,8 @@ export function upsertSection(input: {
     studyAreaId: input.studyAreaId ?? null,
     name: input.name.trim() || 'Section',
     sortOrder: input.sortOrder ?? max.m + 1,
-    totalUnits: input.totalUnits ?? null,
+    // Default 1 unit so Mark done / Mark not done maps cleanly to completed vs incomplete.
+    totalUnits: input.totalUnits !== undefined ? input.totalUnits : 1,
     completedUnits: input.completedUnits ?? 0,
     notes: input.notes ?? ''
   }
@@ -899,14 +951,18 @@ export function listQueue(projectId: string, includeCompleted = false): QueueIte
 
 /** Items scheduled for tomorrow (not yet on Today). */
 export function listTomorrowQueue(projectId: string): QueueItem[] {
-  const tomorrow = localDateISO(1)
+  return listQueueForDate(projectId, localDateISO(1))
+}
+
+/** Active (incomplete) items for an exact calendar date. */
+export function listQueueForDate(projectId: string, forDate: string): QueueItem[] {
   const rows = getDb()
     .prepare(
       `SELECT * FROM queue_items
        WHERE project_id = ? AND completed = 0 AND for_date = ?
        ORDER BY sort_order ASC`
     )
-    .all(projectId, tomorrow) as Array<Record<string, unknown>>
+    .all(projectId, forDate) as Array<Record<string, unknown>>
   return rows.map(mapQueueRow)
 }
 
@@ -924,21 +980,37 @@ export function addQueueItem(input: {
       : !input.when || input.when === 'today'
         ? localDateISO(0)
         : input.when
+  return insertQueueItemForDate({
+    projectId: input.projectId,
+    resourceId: input.resourceId ?? null,
+    description: input.description,
+    estimatedMinutes: input.estimatedMinutes ?? null,
+    forDate
+  })
+}
+
+function insertQueueItemForDate(input: {
+  projectId: string
+  resourceId: string | null
+  description: string
+  estimatedMinutes: number | null
+  forDate: string
+}): QueueItem {
   const max = getDb()
     .prepare(
       `SELECT COALESCE(MAX(sort_order), -1) AS m FROM queue_items
        WHERE project_id = ? AND completed = 0 AND (for_date IS NULL OR for_date = ?)`
     )
-    .get(input.projectId, forDate) as { m: number }
+    .get(input.projectId, input.forDate) as { m: number }
   const item: QueueItem = {
     id: randomUUID(),
     projectId: input.projectId,
-    resourceId: input.resourceId ?? null,
+    resourceId: input.resourceId,
     description: input.description.trim() || 'Study task',
-    estimatedMinutes: input.estimatedMinutes ?? null,
+    estimatedMinutes: input.estimatedMinutes,
     sortOrder: max.m + 1,
     completed: false,
-    forDate,
+    forDate: input.forDate,
     createdAt: nowIso()
   }
   getDb()
@@ -957,6 +1029,39 @@ export function addQueueItem(input: {
       item.forDate
     )
   return item
+}
+
+/**
+ * Add the same task to one day or many days (inclusive date range → one queue row per day).
+ */
+export function addQueueItemsForDates(input: {
+  projectId: string
+  resourceId?: string | null
+  description: string
+  estimatedMinutes?: number | null
+  startDate: string
+  endDate?: string
+}): QueueItem[] {
+  const dates = eachDateInclusive(input.startDate, input.endDate ?? input.startDate)
+  if (!dates.length) {
+    throw new Error('Pick a valid start (and optional end) date.')
+  }
+  const created: QueueItem[] = []
+  const tx = getDb().transaction(() => {
+    for (const forDate of dates) {
+      created.push(
+        insertQueueItemForDate({
+          projectId: input.projectId,
+          resourceId: input.resourceId ?? null,
+          description: input.description,
+          estimatedMinutes: input.estimatedMinutes ?? null,
+          forDate
+        })
+      )
+    }
+  })
+  tx()
+  return created
 }
 
 export function updateQueueItem(
@@ -1182,6 +1287,157 @@ export function deletePracticeExam(id: string): void {
   getDb().prepare('DELETE FROM practice_exams WHERE id = ?').run(id)
 }
 
+function mapMissedQuestion(r: Record<string, unknown>): MissedQuestion {
+  return {
+    id: String(r.id),
+    examId: String(r.exam_id),
+    sectionCode: String(r.section_code) as ExamSectionCode,
+    prompt: String(r.prompt ?? ''),
+    correctAnswer: String(r.correct_answer ?? ''),
+    commentary: String(r.commentary ?? ''),
+    confidence: Math.min(5, Math.max(1, Number(r.confidence) || 1)),
+    inRotation: Boolean(r.in_rotation),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at)
+  }
+}
+
+export function listMissedQuestions(examId: string): MissedQuestion[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT * FROM practice_missed_questions WHERE exam_id = ?
+       ORDER BY section_code ASC, created_at ASC`
+    )
+    .all(examId) as Array<Record<string, unknown>>
+  return rows.map(mapMissedQuestion)
+}
+
+export function listMissedQuestionsInRotation(projectId: string): MissedQuestion[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT mq.* FROM practice_missed_questions mq
+       JOIN practice_exams e ON e.id = mq.exam_id
+       WHERE e.project_id = ? AND mq.in_rotation = 1
+       ORDER BY mq.confidence ASC, mq.updated_at ASC`
+    )
+    .all(projectId) as Array<Record<string, unknown>>
+  return rows.map(mapMissedQuestion)
+}
+
+export function upsertMissedQuestion(input: {
+  id?: string
+  examId: string
+  sectionCode: ExamSectionCode
+  prompt: string
+  correctAnswer?: string
+  commentary?: string
+  confidence?: number
+  inRotation?: boolean
+}): MissedQuestion {
+  const stamp = nowIso()
+  const confidence = Math.min(5, Math.max(1, Math.round(input.confidence ?? 1)))
+  if (input.id) {
+    getDb()
+      .prepare(
+        `UPDATE practice_missed_questions SET
+          section_code = ?, prompt = ?, correct_answer = ?, commentary = ?,
+          confidence = ?, in_rotation = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(
+        input.sectionCode,
+        input.prompt.trim(),
+        (input.correctAnswer ?? '').trim(),
+        (input.commentary ?? '').trim(),
+        confidence,
+        input.inRotation === false ? 0 : 1,
+        stamp,
+        input.id
+      )
+    const row = getDb()
+      .prepare('SELECT * FROM practice_missed_questions WHERE id = ?')
+      .get(input.id) as Record<string, unknown>
+    return mapMissedQuestion(row)
+  }
+  const q: MissedQuestion = {
+    id: randomUUID(),
+    examId: input.examId,
+    sectionCode: input.sectionCode,
+    prompt: input.prompt.trim(),
+    correctAnswer: (input.correctAnswer ?? '').trim(),
+    commentary: (input.commentary ?? '').trim(),
+    confidence,
+    inRotation: input.inRotation !== false,
+    createdAt: stamp,
+    updatedAt: stamp
+  }
+  getDb()
+    .prepare(
+      `INSERT INTO practice_missed_questions (
+        id, exam_id, section_code, prompt, correct_answer, commentary,
+        confidence, in_rotation, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      q.id,
+      q.examId,
+      q.sectionCode,
+      q.prompt,
+      q.correctAnswer,
+      q.commentary,
+      q.confidence,
+      q.inRotation ? 1 : 0,
+      q.createdAt,
+      q.updatedAt
+    )
+  return q
+}
+
+export function updateMissedQuestionConfidence(id: string, confidence: number): MissedQuestion {
+  const stamp = nowIso()
+  const c = Math.min(5, Math.max(1, Math.round(confidence)))
+  getDb()
+    .prepare('UPDATE practice_missed_questions SET confidence = ?, updated_at = ? WHERE id = ?')
+    .run(c, stamp, id)
+  const row = getDb()
+    .prepare('SELECT * FROM practice_missed_questions WHERE id = ?')
+    .get(id) as Record<string, unknown>
+  if (!row) throw new Error('Missed question not found')
+  return mapMissedQuestion(row)
+}
+
+export function setMissedQuestionInRotation(id: string, inRotation: boolean): MissedQuestion {
+  const stamp = nowIso()
+  getDb()
+    .prepare('UPDATE practice_missed_questions SET in_rotation = ?, updated_at = ? WHERE id = ?')
+    .run(inRotation ? 1 : 0, stamp, id)
+  const row = getDb()
+    .prepare('SELECT * FROM practice_missed_questions WHERE id = ?')
+    .get(id) as Record<string, unknown>
+  if (!row) throw new Error('Missed question not found')
+  return mapMissedQuestion(row)
+}
+
+export function deleteMissedQuestion(id: string): void {
+  getDb().prepare('DELETE FROM practice_missed_questions WHERE id = ?').run(id)
+}
+
+export function getMeta(key: string): string | null {
+  const row = getDb().prepare('SELECT value FROM meta WHERE key = ?').get(key) as
+    | { value: string }
+    | undefined
+  return row?.value ?? null
+}
+
+export function setMeta(key: string, value: string): void {
+  getDb()
+    .prepare(
+      `INSERT INTO meta (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    )
+    .run(key, value)
+}
+
 export function exportBackup(): BackupPayload {
   const projects = listProjects(true)
   const studyAreas: Category[] = []
@@ -1190,10 +1446,15 @@ export function exportBackup(): BackupPayload {
   const history: StudyHistoryEntry[] = []
   const queue: QueueItem[] = []
   const practiceExams: PracticeExam[] = []
+  const missedQuestions: MissedQuestion[] = []
 
   for (const p of projects) {
     studyAreas.push(...listCategories(p.id))
-    practiceExams.push(...listPracticeExams(p.id))
+    const exams = listPracticeExams(p.id)
+    practiceExams.push(...exams)
+    for (const exam of exams) {
+      missedQuestions.push(...listMissedQuestions(exam.id))
+    }
     const resRows = getDb()
       .prepare('SELECT * FROM resources WHERE project_id = ?')
       .all(p.id) as Array<Record<string, unknown>>
@@ -1216,7 +1477,8 @@ export function exportBackup(): BackupPayload {
     sections,
     history,
     queue,
-    practiceExams
+    practiceExams,
+    missedQuestions
   }
 }
 
@@ -1256,6 +1518,7 @@ export function restoreBackup(payload: BackupPayload, recoveryDir: string): stri
       DELETE FROM resource_study_areas;
       DELETE FROM resources;
       DELETE FROM study_areas;
+      DELETE FROM practice_missed_questions;
       DELETE FROM practice_exams;
       DELETE FROM projects;
     `)
@@ -1377,6 +1640,27 @@ export function restoreBackup(payload: BackupPayload, recoveryDir: string): stri
         e.notes ?? '',
         e.createdAt,
         e.updatedAt
+      )
+    }
+
+    const insertMissed = database.prepare(
+      `INSERT INTO practice_missed_questions (
+        id, exam_id, section_code, prompt, correct_answer, commentary,
+        confidence, in_rotation, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    for (const q of payload.missedQuestions ?? []) {
+      insertMissed.run(
+        q.id,
+        q.examId,
+        q.sectionCode,
+        q.prompt,
+        q.correctAnswer ?? '',
+        q.commentary ?? '',
+        Math.min(5, Math.max(1, q.confidence || 1)),
+        q.inRotation === false ? 0 : 1,
+        q.createdAt,
+        q.updatedAt
       )
     }
   })

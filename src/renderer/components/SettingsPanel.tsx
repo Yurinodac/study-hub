@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { PracticeExam, PracticeReviewStatus, Project } from '../../shared/types'
-import { PRACTICE_REVIEW_LABELS } from '../../shared/types'
+import type {
+  ExamSectionCode,
+  MissedQuestion,
+  PracticeExam,
+  PracticeReviewStatus,
+  Project
+} from '../../shared/types'
+import { EXAM_SECTION_CODES, PRACTICE_REVIEW_LABELS } from '../../shared/types'
 import {
   MCAT_EXAM_SECTIONS,
   PRACTICE_SCORE_MAX,
@@ -36,6 +42,21 @@ export default function SettingsPanel({
   const [scoreBb, setScoreBb] = useState('125')
   const [scorePs, setScorePs] = useState('125')
   const [reviewStatus, setReviewStatus] = useState<PracticeReviewStatus>('not_reviewed')
+  const [expandedExamId, setExpandedExamId] = useState<string | null>(null)
+  const [missedByExam, setMissedByExam] = useState<Record<string, MissedQuestion[]>>({})
+  const [rotation, setRotation] = useState<MissedQuestion[]>([])
+  const [flashIndex, setFlashIndex] = useState(0)
+  const [flashRevealed, setFlashRevealed] = useState(false)
+  const [celeb, setCeleb] = useState<{ hasCustomImage: boolean; imageUrl: string | null }>({
+    hasCustomImage: false,
+    imageUrl: null
+  })
+
+  // Missed-question draft
+  const [mqSection, setMqSection] = useState<ExamSectionCode>('C/P')
+  const [mqPrompt, setMqPrompt] = useState('')
+  const [mqAnswer, setMqAnswer] = useState('')
+  const [mqNotes, setMqNotes] = useState('')
 
   const current = projects.find((p) => p.id === projectId)
   const previewTotal = useMemo(() => {
@@ -48,7 +69,14 @@ export default function SettingsPanel({
   }, [scoreCp, scoreCars, scoreBb, scorePs])
 
   const reloadExams = async () => {
-    setExams(await window.studyHub.listPracticeExams(projectId))
+    const list = await window.studyHub.listPracticeExams(projectId)
+    setExams(list)
+    setRotation(await window.studyHub.listMissedQuestionsInRotation(projectId))
+  }
+
+  const loadMissed = async (examId: string) => {
+    const list = await window.studyHub.listMissedQuestions(examId)
+    setMissedByExam((prev) => ({ ...prev, [examId]: list }))
   }
 
   useEffect(() => {
@@ -56,10 +84,13 @@ export default function SettingsPanel({
       setHasSample(await window.studyHub.sampleStatus(projectId))
       setPaths(await window.studyHub.getPaths())
       setRenameValue(current?.name ?? '')
+      setCeleb(await window.studyHub.getCelebration())
       await reloadExams()
     })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, projects])
+
+  const flashCard = rotation[flashIndex] ?? null
 
   return (
     <div>
@@ -113,6 +144,48 @@ export default function SettingsPanel({
       <section className="panel">
         <div className="section-head">
           <div>
+            <h2>Completion celebration</h2>
+            <p>
+              When you mark a Today queue task complete, Study Hub shows a short celebration. Optionally add your own
+              picture (stored only on this PC).
+            </p>
+          </div>
+        </div>
+        {celeb.imageUrl ? (
+          <img className="celebration-image preview" src={celeb.imageUrl} alt="Current celebration picture" />
+        ) : (
+          <p className="meta">No custom picture yet — celebrations show a simple default graphic.</p>
+        )}
+        <div className="btn-row">
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={async () => {
+              const next = await window.studyHub.pickCelebrationImage()
+              setCeleb(next)
+              showStatus(next.hasCustomImage ? 'Celebration picture saved.' : 'No picture chosen.')
+            }}
+          >
+            Choose celebration picture
+          </button>
+          {celeb.hasCustomImage && (
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={async () => {
+                setCeleb(await window.studyHub.clearCelebrationImage())
+                showStatus('Celebration picture cleared.')
+              }}
+            >
+              Remove picture
+            </button>
+          )}
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="section-head">
+          <div>
             <h2>Official MCAT exam sections</h2>
             <p>
               Reference only — not used to tag resources. Everyday organization uses the eight study categories
@@ -138,7 +211,10 @@ export default function SettingsPanel({
         <div className="section-head">
           <div>
             <h2>Practice exams</h2>
-            <p>Simple score log for full-lengths. Section scores are 118–132; total is calculated for you.</p>
+            <p>
+              Score log (118–132 per section) plus missed questions and a simple flashcard review. Confidence marks are
+              for review priority — not a mastery score.
+            </p>
           </div>
         </div>
         <form
@@ -246,32 +322,271 @@ export default function SettingsPanel({
           </p>
         ) : (
           <ul className="history-list" style={{ marginTop: '1rem' }}>
-            {exams.map((exam) => (
-              <li key={exam.id}>
-                <strong>{exam.name}</strong>
-                <p className="meta">
-                  {exam.takenOn} · Total {exam.total} · C/P {exam.scoreCp} · CARS {exam.scoreCars} · B/B{' '}
-                  {exam.scoreBb} · P/S {exam.scorePs}
-                </p>
-                <p className="meta">{PRACTICE_REVIEW_LABELS[exam.reviewStatus]}</p>
-                <div className="btn-row">
-                  <button
-                    type="button"
-                    className="btn btn-danger"
-                    onClick={async () => {
-                      if (!window.confirm(`Delete practice exam “${exam.name}”?`)) return
-                      await window.studyHub.deletePracticeExam(exam.id)
-                      showStatus('Practice exam deleted.')
-                      await reloadExams()
-                      onChanged()
-                    }}
-                  >
-                    Delete
-                  </button>
-                </div>
-              </li>
-            ))}
+            {exams.map((exam) => {
+              const open = expandedExamId === exam.id
+              const missed = missedByExam[exam.id] ?? []
+              return (
+                <li key={exam.id}>
+                  <strong>{exam.name}</strong>
+                  <p className="meta">
+                    {exam.takenOn} · Total {exam.total} · C/P {exam.scoreCp} · CARS {exam.scoreCars} · B/B{' '}
+                    {exam.scoreBb} · P/S {exam.scorePs}
+                  </p>
+                  <p className="meta">{PRACTICE_REVIEW_LABELS[exam.reviewStatus]}</p>
+                  <div className="btn-row">
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      onClick={async () => {
+                        if (open) {
+                          setExpandedExamId(null)
+                          return
+                        }
+                        setExpandedExamId(exam.id)
+                        await loadMissed(exam.id)
+                      }}
+                    >
+                      {open ? 'Hide missed questions' : 'Missed questions'}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-danger"
+                      onClick={async () => {
+                        if (!window.confirm(`Delete practice exam “${exam.name}”?`)) return
+                        await window.studyHub.deletePracticeExam(exam.id)
+                        showStatus('Practice exam deleted.')
+                        await reloadExams()
+                        onChanged()
+                      }}
+                    >
+                      Delete
+                    </button>
+                  </div>
+
+                  {open && (
+                    <div className="missed-block">
+                      <h3>Log a missed question</h3>
+                      <form
+                        className="form-grid"
+                        onSubmit={async (e) => {
+                          e.preventDefault()
+                          if (!mqPrompt.trim()) return
+                          await window.studyHub.upsertMissedQuestion({
+                            examId: exam.id,
+                            sectionCode: mqSection,
+                            prompt: mqPrompt.trim(),
+                            correctAnswer: mqAnswer.trim(),
+                            commentary: mqNotes.trim(),
+                            confidence: 2,
+                            inRotation: true
+                          })
+                          setMqPrompt('')
+                          setMqAnswer('')
+                          setMqNotes('')
+                          showStatus('Missed question saved.')
+                          await loadMissed(exam.id)
+                          setRotation(await window.studyHub.listMissedQuestionsInRotation(projectId))
+                          onChanged()
+                        }}
+                      >
+                        <label>
+                          Exam section
+                          <select
+                            value={mqSection}
+                            onChange={(e) => setMqSection(e.target.value as ExamSectionCode)}
+                          >
+                            {EXAM_SECTION_CODES.map((code) => (
+                              <option key={code} value={code}>
+                                {code}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label>
+                          Question text or ID
+                          <input
+                            value={mqPrompt}
+                            onChange={(e) => setMqPrompt(e.target.value)}
+                            required
+                            autoComplete="off"
+                            placeholder="Q14 or short prompt"
+                          />
+                        </label>
+                        <label>
+                          Correct answer
+                          <input
+                            value={mqAnswer}
+                            onChange={(e) => setMqAnswer(e.target.value)}
+                            autoComplete="off"
+                          />
+                        </label>
+                        <label>
+                          Commentary / notes
+                          <textarea value={mqNotes} onChange={(e) => setMqNotes(e.target.value)} rows={2} />
+                        </label>
+                        <button type="submit" className="btn btn-primary">
+                          Add missed question
+                        </button>
+                      </form>
+
+                      {missed.length === 0 ? (
+                        <p className="meta">No missed questions for this exam yet.</p>
+                      ) : (
+                        <ul className="history-list">
+                          {missed.map((q) => (
+                            <li key={q.id}>
+                              <strong>
+                                {q.sectionCode}: {q.prompt}
+                              </strong>
+                              <p className="meta">
+                                Answer: {q.correctAnswer || '—'} · Confidence {q.confidence}/5
+                                {q.inRotation ? '' : ' · removed from rotation'}
+                              </p>
+                              {q.commentary ? <p className="meta">{q.commentary}</p> : null}
+                              <div className="btn-row">
+                                {q.inRotation ? (
+                                  <button
+                                    type="button"
+                                    className="btn btn-ghost"
+                                    onClick={async () => {
+                                      await window.studyHub.setMissedQuestionInRotation(q.id, false)
+                                      await loadMissed(exam.id)
+                                      setRotation(
+                                        await window.studyHub.listMissedQuestionsInRotation(projectId)
+                                      )
+                                      showStatus('Removed from flashcard rotation.')
+                                    }}
+                                  >
+                                    Remove from flashcards
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className="btn btn-ghost"
+                                    onClick={async () => {
+                                      await window.studyHub.setMissedQuestionInRotation(q.id, true)
+                                      await loadMissed(exam.id)
+                                      setRotation(
+                                        await window.studyHub.listMissedQuestionsInRotation(projectId)
+                                      )
+                                      showStatus('Added back to flashcard rotation.')
+                                    }}
+                                  >
+                                    Add to flashcards
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  className="btn btn-danger"
+                                  onClick={async () => {
+                                    if (!window.confirm('Delete this missed question?')) return
+                                    await window.studyHub.deleteMissedQuestion(q.id)
+                                    await loadMissed(exam.id)
+                                    setRotation(
+                                      await window.studyHub.listMissedQuestionsInRotation(projectId)
+                                    )
+                                    showStatus('Missed question deleted.')
+                                  }}
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
+                </li>
+              )
+            })}
           </ul>
+        )}
+      </section>
+
+      <section className="panel">
+        <div className="section-head">
+          <div>
+            <h2>Missed questions review</h2>
+            <p>Flashcard-style review for questions still in rotation. Mark confidence, or remove from rotation.</p>
+          </div>
+        </div>
+        {!flashCard ? (
+          <p className="meta">No missed questions in rotation yet. Add some under a practice exam.</p>
+        ) : (
+          <div className="flashcard">
+            <p className="meta">
+              {flashIndex + 1} of {rotation.length} · {flashCard.sectionCode}
+            </p>
+            <p className="queue-desc">{flashCard.prompt}</p>
+            {flashRevealed ? (
+              <>
+                <p>
+                  <strong>Answer:</strong> {flashCard.correctAnswer || '—'}
+                </p>
+                {flashCard.commentary ? <p className="meta">{flashCard.commentary}</p> : null}
+                <p className="field-label">Confidence (1 shaky → 5 solid)</p>
+                <div className="btn-row">
+                  {[1, 2, 3, 4, 5].map((n) => (
+                    <button
+                      key={n}
+                      type="button"
+                      className={`btn ${flashCard.confidence === n ? 'btn-primary' : 'btn-ghost'}`}
+                      onClick={async () => {
+                        await window.studyHub.setMissedQuestionConfidence(flashCard.id, n)
+                        setRotation(await window.studyHub.listMissedQuestionsInRotation(projectId))
+                        showStatus(`Confidence set to ${n}.`)
+                      }}
+                    >
+                      {n}
+                    </button>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <button type="button" className="btn btn-secondary" onClick={() => setFlashRevealed(true)}>
+                Show answer
+              </button>
+            )}
+            <div className="btn-row" style={{ marginTop: '0.75rem' }}>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                disabled={flashIndex <= 0}
+                onClick={() => {
+                  setFlashIndex((i) => Math.max(0, i - 1))
+                  setFlashRevealed(false)
+                }}
+              >
+                Previous
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                disabled={flashIndex >= rotation.length - 1}
+                onClick={() => {
+                  setFlashIndex((i) => Math.min(rotation.length - 1, i + 1))
+                  setFlashRevealed(false)
+                }}
+              >
+                Next
+              </button>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={async () => {
+                  await window.studyHub.setMissedQuestionInRotation(flashCard.id, false)
+                  const next = await window.studyHub.listMissedQuestionsInRotation(projectId)
+                  setRotation(next)
+                  setFlashIndex((i) => Math.min(i, Math.max(0, next.length - 1)))
+                  setFlashRevealed(false)
+                  showStatus('Removed from flashcard rotation.')
+                }}
+              >
+                Remove from flashcards
+              </button>
+            </div>
+          </div>
         )}
       </section>
 

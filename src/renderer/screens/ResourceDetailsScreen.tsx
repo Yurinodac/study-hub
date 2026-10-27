@@ -14,23 +14,44 @@ import type {
 } from '../../shared/types'
 import { RESOURCE_TYPE_LABELS } from '../../shared/types'
 import {
-  completionPercent,
+  chapterCompletionFromSections,
+  embeddedCustomItems,
   formatTimestamp,
+  isChapterMarkedDone,
+  itemsTabLabel,
+  itemsTabNoun,
+  mergeProgressConfig,
   parseTimestamp,
+  readingMarkDoneValidation,
+  resourceHasItemsTab,
   studiedPartLabel,
   summarizeProgress
 } from '../../shared/progress'
 import { shouldApplyServerSnapshot } from '../../shared/draft-sync'
 import type { DetailsFocus } from '../App'
+import CompletionBar from '../components/CompletionBar'
+import { formatYmd } from '../../shared/dates'
+
+type NextActionSchedule =
+  | { mode: 'none' }
+  | { mode: 'today' }
+  | { mode: 'tomorrow' }
+  | { mode: 'date'; startDate: string }
+  | { mode: 'range'; startDate: string; endDate: string }
 
 type TabId = 'overview' | 'progress' | 'chapters' | 'history'
 
-const TABS: Array<{ id: TabId; label: string }> = [
-  { id: 'overview', label: 'Overview' },
-  { id: 'progress', label: 'Progress' },
-  { id: 'chapters', label: 'Chapters' },
-  { id: 'history', label: 'History' }
-]
+function tabsForResource(resource: Resource): Array<{ id: TabId; label: string }> {
+  const tabs: Array<{ id: TabId; label: string }> = [
+    { id: 'overview', label: 'Overview' },
+    { id: 'progress', label: 'Progress' }
+  ]
+  if (resourceHasItemsTab(resource)) {
+    tabs.push({ id: 'chapters', label: itemsTabLabel(resource) })
+  }
+  tabs.push({ id: 'history', label: 'History' })
+  return tabs
+}
 
 function focusToTab(focus: DetailsFocus): TabId {
   if (focus === 'progress') return 'progress'
@@ -63,13 +84,34 @@ export default function ResourceDetailsScreen({
   const [tab, setTab] = useState<TabId>(focusToTab(initialFocus))
   const [selectedAreaIds, setSelectedAreaIds] = useState<string[]>([])
   const [sectionName, setSectionName] = useState('')
-  const [queueNextAction, setQueueNextAction] = useState('')
   /** Blocks background reloads from wiping fields while the user is typing. */
   const overviewDirtyRef = useRef(false)
 
   const reload = async (force = false) => {
-    const r = await window.studyHub.getResource(resourceId)
-    setSections(await window.studyHub.listSections(resourceId))
+    let r = await window.studyHub.getResource(resourceId)
+    let secs = await window.studyHub.listSections(resourceId)
+    // One-time: move embedded checklist/milestone config rows onto the items tab (sections).
+    if (r?.type === 'custom' && secs.length === 0) {
+      const embedded = embeddedCustomItems(r.config as CustomConfig)
+      if (embedded.length) {
+        for (const item of embedded) {
+          await window.studyHub.upsertSection({
+            resourceId,
+            name: item.label,
+            totalUnits: 1,
+            completedUnits: item.done ? 1 : 0
+          })
+        }
+        const cleared: CustomConfig = {
+          ...(r.config as CustomConfig),
+          checklist: [],
+          milestones: []
+        }
+        r = await window.studyHub.updateResource(resourceId, { config: cleared })
+        secs = await window.studyHub.listSections(resourceId)
+      }
+    }
+    setSections(secs)
     setHistory(await window.studyHub.listHistory(resourceId))
     if (!r) {
       setResource(null)
@@ -78,7 +120,6 @@ export default function ResourceDetailsScreen({
     if (force || shouldApplyServerSnapshot(overviewDirtyRef.current)) {
       setResource(r)
       setSelectedAreaIds(r.studyAreaIds)
-      setQueueNextAction(r.nextAction ?? '')
       overviewDirtyRef.current = false
     } else {
       // Keep draft fields; still refresh non-draft resource metadata used elsewhere.
@@ -89,6 +130,7 @@ export default function ResourceDetailsScreen({
               name: prev.name,
               locationKind: prev.locationKind,
               locationValue: prev.locationValue,
+              config: prev.config,
               stoppingPointNote: prev.stoppingPointNote,
               notes: prev.notes,
               confidence: prev.confidence
@@ -110,6 +152,12 @@ export default function ResourceDetailsScreen({
     setTab(focusToTab(initialFocus))
   }, [initialFocus, resourceId])
 
+  useEffect(() => {
+    if (!resource) return
+    const allowed = new Set(tabsForResource(resource).map((t) => t.id))
+    if (!allowed.has(tab)) setTab('overview')
+  }, [resource, tab])
+
   if (!resource) {
     return (
       <section className="panel">
@@ -121,15 +169,26 @@ export default function ResourceDetailsScreen({
     )
   }
 
-  const pct = completionPercent(resource)
+  const sectionProgress = chapterCompletionFromSections(
+    sections,
+    resource.type === 'textbook' ? (resource.config as TextbookConfig).totalChapters : null
+  )
   const savedUrl =
     resource.locationKind === 'url' && resource.locationValue.trim()
       ? resource.locationValue.trim()
       : ''
+  const openLabel =
+    resource.type === 'anki' && resource.locationKind === 'app' ? 'Open Anki app' : 'Open resource'
   const saveProgress = async (
     patch: Partial<Resource> & { studyAreaIds?: string[] },
     summary: string,
-    extras: { studiedPart?: string; details?: string; studyAreaIds?: string[]; sectionId?: string }
+    extras: {
+      studiedPart?: string
+      details?: string
+      studyAreaIds?: string[]
+      sectionId?: string
+      sectionIds?: string[]
+    }
   ) => {
     const updated = await window.studyHub.updateResource(
       resource.id,
@@ -155,26 +214,9 @@ export default function ResourceDetailsScreen({
     })
     if (!overviewDirtyRef.current) {
       setSelectedAreaIds(updated.studyAreaIds)
-      setQueueNextAction(updated.nextAction ?? '')
     }
     setHistory(await window.studyHub.listHistory(resource.id))
     setSections(await window.studyHub.listSections(resource.id))
-    onChanged()
-  }
-
-  const addNextToQueue = async (when: 'today' | 'tomorrow') => {
-    const text = queueNextAction.trim() || resource.nextAction.trim()
-    if (!text) {
-      showStatus('Enter a next action first.', 'warn')
-      return
-    }
-    await window.studyHub.addQueueItem({
-      projectId: resource.projectId,
-      resourceId: resource.id,
-      description: text,
-      when
-    })
-    showStatus(when === 'today' ? 'Added to Today’s queue.' : 'Added to Tomorrow’s queue.')
     onChanged()
   }
 
@@ -198,24 +240,20 @@ export default function ResourceDetailsScreen({
               {RESOURCE_TYPE_LABELS[resource.type]}
               {resource.isSample ? ' · SAMPLE' : ''}
               {' · '}
-              {summarizeProgress(resource)}
+              {summarizeProgress(resource, sectionProgress)}
             </p>
           </div>
           <div className="btn-row">
             <button type="button" className="btn btn-primary" onClick={() => void onOpenResource(resource)}>
-              Open resource
+              {openLabel}
             </button>
           </div>
         </div>
 
-        {pct != null && (
-          <div className="progress-meter" aria-label={`About ${pct}% complete`}>
-            <span style={{ width: `${pct}%` }} />
-          </div>
-        )}
+        <CompletionBar resource={resource} sectionProgress={sectionProgress} />
 
         <div className="tablist" role="tablist" aria-label="Resource details">
-          {TABS.map((t) => (
+          {tabsForResource(resource).map((t) => (
             <button
               key={t.id}
               type="button"
@@ -244,15 +282,14 @@ export default function ResourceDetailsScreen({
                 studyAreaIds: selectedAreaIds,
                 locationKind: resource.locationKind,
                 locationValue: resource.locationValue,
+                config: resource.config,
                 stoppingPointNote: resource.stoppingPointNote,
-                nextAction: queueNextAction,
                 notes: resource.notes,
                 confidence: resource.confidence
               })
               overviewDirtyRef.current = false
               setResource(updated)
               setSelectedAreaIds(updated.studyAreaIds)
-              setQueueNextAction(updated.nextAction ?? '')
               showStatus('Resource details saved.')
               onChanged()
             }}
@@ -309,6 +346,7 @@ export default function ResourceDetailsScreen({
                 <option value="none">No link yet</option>
                 <option value="url">Website link</option>
                 <option value="file">Local file</option>
+                <option value="app">Desktop app (e.g. Anki)</option>
               </select>
             </label>
 
@@ -360,6 +398,57 @@ export default function ResourceDetailsScreen({
               </div>
             )}
 
+            {resource.locationKind === 'app' && (
+              <div>
+                <p className="helper-text">
+                  Opens the app on this computer (for example Anki). Study Hub does not sync Anki decks — it only
+                  launches the app.
+                </p>
+                <p className="meta">{resource.locationValue || 'No app chosen yet'}</p>
+                <div className="btn-row">
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    onClick={async () => {
+                      const path = await window.studyHub.pickApp()
+                      if (path) {
+                        overviewDirtyRef.current = true
+                        setResource((prev) => (prev ? { ...prev, locationValue: path } : prev))
+                      }
+                    }}
+                  >
+                    Browse to app (.exe)
+                  </button>
+                  {resource.type === 'anki' && (
+                    <button
+                      type="button"
+                      className="btn btn-ghost"
+                      onClick={async () => {
+                        const found = await window.studyHub.findAnkiExe()
+                        if (found) {
+                          overviewDirtyRef.current = true
+                          setResource((prev) => (prev ? { ...prev, locationValue: found } : prev))
+                          showStatus('Found Anki on this PC.')
+                        } else {
+                          showStatus(
+                            'Anki was not found in the usual folders. Install Anki or browse to anki.exe.',
+                            'warn'
+                          )
+                        }
+                      }}
+                    >
+                      Find Anki automatically
+                    </button>
+                  )}
+                  {resource.locationValue.trim() && (
+                    <button type="button" className="btn btn-primary" onClick={() => void onOpenResource(resource)}>
+                      Open Anki app
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
             <label>
               Stopping point note
               <input
@@ -374,30 +463,249 @@ export default function ResourceDetailsScreen({
               />
             </label>
 
-            <label>
-              Next action
-              <input
-                name="next-action"
-                autoComplete="off"
-                value={queueNextAction}
-                onChange={(e) => {
-                  overviewDirtyRef.current = true
-                  setQueueNextAction(e.target.value)
-                }}
-                placeholder="What should you do next?"
-              />
-            </label>
-            <p className="meta" style={{ margin: 0 }}>
-              To queue a next action with progress, use the Progress tab. Or add it here:
-            </p>
-            <div className="btn-row">
-              <button type="button" className="btn btn-secondary" onClick={() => void addNextToQueue('today')}>
-                Add to Today’s queue
-              </button>
-              <button type="button" className="btn btn-secondary" onClick={() => void addNextToQueue('tomorrow')}>
-                Add to Tomorrow’s queue
-              </button>
-            </div>
+            {resource.type === 'textbook' && (
+              <>
+                <p className="helper-text" style={{ margin: 0 }}>
+                  The completion bar counts chapters marked done. On <strong>Progress</strong>, select one or more
+                  chapters from the Chapters list and mark them complete to raise the count. You can also mark done on
+                  the Chapters tab.
+                </p>
+                {sectionProgress ? (
+                  <p className="meta" style={{ margin: 0 }}>
+                    Chapters marked done: <strong>{sectionProgress.done}</strong> of{' '}
+                    <strong>{sectionProgress.total}</strong>
+                  </p>
+                ) : (
+                  <p className="meta" style={{ margin: 0 }}>
+                    No chapters yet — add them on the Chapters tab, then link them when logging Progress.
+                  </p>
+                )}
+                <label>
+                  Expected total chapters (optional — for the bar if you haven’t listed every chapter yet)
+                  <input
+                    type="number"
+                    min={1}
+                    value={(resource.config as TextbookConfig).totalChapters ?? ''}
+                    onChange={(e) => {
+                      overviewDirtyRef.current = true
+                      const totalChapters = e.target.value ? Number(e.target.value) : null
+                      setResource((prev) =>
+                        prev
+                          ? { ...prev, config: { ...(prev.config as TextbookConfig), totalChapters } }
+                          : prev
+                      )
+                    }}
+                  />
+                </label>
+                <label>
+                  Total pages (optional — page-based bar if you prefer pages over chapters)
+                  <input
+                    type="number"
+                    min={1}
+                    value={(resource.config as TextbookConfig).totalPages ?? ''}
+                    onChange={(e) => {
+                      overviewDirtyRef.current = true
+                      const totalPages = e.target.value ? Number(e.target.value) : null
+                      setResource((prev) =>
+                        prev
+                          ? { ...prev, config: { ...(prev.config as TextbookConfig), totalPages } }
+                          : prev
+                      )
+                    }}
+                  />
+                </label>
+              </>
+            )}
+            {resource.type === 'video' && (
+              <label>
+                Total lessons (optional — enables the lessons progress bar)
+                <input
+                  type="number"
+                  min={1}
+                  value={(resource.config as VideoConfig).totalLessons ?? ''}
+                  onChange={(e) => {
+                    overviewDirtyRef.current = true
+                    const totalLessons = e.target.value ? Number(e.target.value) : null
+                    setResource((prev) =>
+                      prev
+                        ? { ...prev, config: { ...(prev.config as VideoConfig), totalLessons } }
+                        : prev
+                    )
+                  }}
+                />
+              </label>
+            )}
+            {resource.type === 'anki' && (
+              <>
+                <p className="helper-text">
+                  Cumulative totals (Progress sessions add to these). Bar = correct ÷ attempted.
+                </p>
+                <label>
+                  Cards attempted (total)
+                  <input
+                    type="number"
+                    min={0}
+                    value={(resource.config as AnkiConfig).cardsAttempted ?? ''}
+                    onChange={(e) => {
+                      overviewDirtyRef.current = true
+                      const cardsAttempted = e.target.value ? Number(e.target.value) : 0
+                      setResource((prev) =>
+                        prev
+                          ? { ...prev, config: { ...(prev.config as AnkiConfig), cardsAttempted } }
+                          : prev
+                      )
+                    }}
+                  />
+                </label>
+                <label>
+                  Cards correct (total)
+                  <input
+                    type="number"
+                    min={0}
+                    value={(resource.config as AnkiConfig).cardsCorrect ?? ''}
+                    onChange={(e) => {
+                      overviewDirtyRef.current = true
+                      const cardsCorrect = e.target.value ? Number(e.target.value) : undefined
+                      setResource((prev) =>
+                        prev
+                          ? { ...prev, config: { ...(prev.config as AnkiConfig), cardsCorrect } }
+                          : prev
+                      )
+                    }}
+                  />
+                </label>
+              </>
+            )}
+            {resource.type === 'custom' && (resource.config as CustomConfig).mode === 'units' && (
+              <>
+                <p className="helper-text">
+                  Set total units for the completion bar (done ÷ total). Progress sessions{' '}
+                  <strong>add</strong> completed units onto the total below.
+                </p>
+                <label>
+                  Unit label
+                  <input
+                    value={(resource.config as CustomConfig).unitLabel ?? 'modules'}
+                    onChange={(e) => {
+                      overviewDirtyRef.current = true
+                      const unitLabel = e.target.value
+                      setResource((prev) =>
+                        prev
+                          ? { ...prev, config: { ...(prev.config as CustomConfig), unitLabel } }
+                          : prev
+                      )
+                    }}
+                  />
+                </label>
+                <label>
+                  Completed units (total)
+                  <input
+                    type="number"
+                    min={0}
+                    value={(resource.config as CustomConfig).completedUnits ?? ''}
+                    onChange={(e) => {
+                      overviewDirtyRef.current = true
+                      const completedUnits = e.target.value ? Number(e.target.value) : 0
+                      setResource((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              config: { ...(prev.config as CustomConfig), completedUnits }
+                            }
+                          : prev
+                      )
+                    }}
+                  />
+                </label>
+                <label>
+                  Total units (for the progress bar)
+                  <input
+                    type="number"
+                    min={1}
+                    value={(resource.config as CustomConfig).totalUnits ?? ''}
+                    onChange={(e) => {
+                      overviewDirtyRef.current = true
+                      const totalUnits = e.target.value ? Number(e.target.value) : null
+                      setResource((prev) =>
+                        prev
+                          ? { ...prev, config: { ...(prev.config as CustomConfig), totalUnits } }
+                          : prev
+                      )
+                    }}
+                  />
+                </label>
+              </>
+            )}
+            {resource.type === 'question_bank' && (
+              <>
+                <p className="helper-text">
+                  Cumulative totals (Progress sessions add to these). Bar = correct ÷ attempted.
+                </p>
+                <label>
+                  Questions attempted (total)
+                  <input
+                    type="number"
+                    min={0}
+                    value={(resource.config as QuestionBankConfig).questionsAttempted ?? ''}
+                    onChange={(e) => {
+                      overviewDirtyRef.current = true
+                      const questionsAttempted = e.target.value ? Number(e.target.value) : 0
+                      setResource((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              config: {
+                                ...(prev.config as QuestionBankConfig),
+                                questionsAttempted
+                              }
+                            }
+                          : prev
+                      )
+                    }}
+                  />
+                </label>
+                <label>
+                  Correct answers (total)
+                  <input
+                    type="number"
+                    min={0}
+                    value={(resource.config as QuestionBankConfig).correctAnswers ?? ''}
+                    onChange={(e) => {
+                      overviewDirtyRef.current = true
+                      const correctAnswers = e.target.value ? Number(e.target.value) : null
+                      setResource((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              config: { ...(prev.config as QuestionBankConfig), correctAnswers }
+                            }
+                          : prev
+                      )
+                    }}
+                  />
+                </label>
+                <label>
+                  Total questions in this set (optional note)
+                  <input
+                    type="number"
+                    min={1}
+                    value={(resource.config as QuestionBankConfig).totalQuestions ?? ''}
+                    onChange={(e) => {
+                      overviewDirtyRef.current = true
+                      const totalQuestions = e.target.value ? Number(e.target.value) : null
+                      setResource((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              config: { ...(prev.config as QuestionBankConfig), totalQuestions }
+                            }
+                          : prev
+                      )
+                    }}
+                  />
+                </label>
+              </>
+            )}
 
             <label>
               Notes
@@ -453,8 +761,10 @@ export default function ResourceDetailsScreen({
             <div>
               <h2>Update progress</h2>
               <p>
-                Fill in what you studied, optionally toggle Today and/or Tomorrow for the next action, then Save. The
-                form clears after a successful save. Use History to delete a mistaken entry.
+                Log <strong>this session</strong> only. Anki, question bank, and custom unit counts{' '}
+                <strong>add</strong> to Overview totals. For readings, select linked chapter(s) to raise the completion
+                count. Checklist and milestone items live on their tab — check them off here. Optionally set a next
+                action and when to queue it, then Save.
               </p>
             </div>
           </div>
@@ -462,7 +772,7 @@ export default function ResourceDetailsScreen({
             resource={resource}
             sections={sections}
             selectedAreaIds={selectedAreaIds}
-            onSave={async (config, extras, summary, hist, queueWhen) => {
+            onSave={async (config, extras, summary, hist, schedule) => {
               await saveProgress(
                 {
                   config,
@@ -474,164 +784,51 @@ export default function ResourceDetailsScreen({
                 hist
               )
               const action = extras.nextAction?.trim()
-              if (action) setQueueNextAction(action)
-              const queued: string[] = []
-              if (action && queueWhen.today) {
-                await window.studyHub.addQueueItem({
-                  projectId: resource.projectId,
-                  resourceId: resource.id,
-                  description: action,
-                  when: 'today'
-                })
-                queued.push('Today')
-              }
-              if (action && queueWhen.tomorrow) {
-                await window.studyHub.addQueueItem({
-                  projectId: resource.projectId,
-                  resourceId: resource.id,
-                  description: action,
-                  when: 'tomorrow'
-                })
-                queued.push('Tomorrow')
-              }
-              if (queued.length) {
-                showStatus(`Progress saved. Next action added to ${queued.join(' and ')}.`)
-              } else {
+              if (!action || schedule.mode === 'none') {
                 showStatus('Progress saved.')
+                return
+              }
+              const base = {
+                projectId: resource.projectId,
+                resourceId: resource.id,
+                description: action
+              }
+              if (schedule.mode === 'today') {
+                await window.studyHub.addQueueItem({ ...base, when: 'today' })
+                showStatus('Progress saved. Next action added to Today’s queue.')
+              } else if (schedule.mode === 'tomorrow') {
+                await window.studyHub.addQueueItem({ ...base, when: 'tomorrow' })
+                showStatus('Progress saved. Next action added to Tomorrow’s queue.')
+              } else if (schedule.mode === 'date') {
+                await window.studyHub.addQueueItemsForDates({ ...base, startDate: schedule.startDate })
+                showStatus(`Progress saved. Next action scheduled for ${schedule.startDate}.`)
+              } else {
+                const items = await window.studyHub.addQueueItemsForDates({
+                  ...base,
+                  startDate: schedule.startDate,
+                  endDate: schedule.endDate
+                })
+                showStatus(
+                  `Progress saved. Next action added to ${items.length} day${items.length === 1 ? '' : 's'}.`
+                )
               }
             }}
           />
         </section>
       )}
 
-      {tab === 'chapters' && (
-        <section className="panel" role="tabpanel" id="panel-chapters" aria-labelledby="tab-chapters">
-          <div className="section-head">
-            <div>
-              <h2>Chapters & sections</h2>
-              <p>
-                Optional advanced detail for <strong>this resource only</strong> (chapters, lessons, modules). Not used
-                to organize the whole app — categories on the resource do that.
-              </p>
-            </div>
-          </div>
-
-          <form
-            className="form-grid"
-            onSubmit={async (e) => {
-              e.preventDefault()
-              if (!sectionName.trim()) return
-              await window.studyHub.upsertSection({
-                resourceId: resource.id,
-                name: sectionName.trim()
-              })
-              setSectionName('')
-              setSections(await window.studyHub.listSections(resource.id))
-              showStatus('Chapter added.')
-              onChanged()
-            }}
-          >
-            <label>
-              Chapter or section name
-              <input
-                type="text"
-                name="sectionName"
-                autoComplete="off"
-                value={sectionName}
-                onChange={(e) => setSectionName(e.target.value)}
-                placeholder="Chapter 4 — Cell membranes"
-              />
-            </label>
-            <p className="helper-text">
-              Tip: name it the way you talk about it. You can pick it from a dropdown when you log progress on this
-              resource.
-            </p>
-            <div className="btn-row">
-              <button type="submit" className="btn btn-primary">
-                Add chapter
-              </button>
-            </div>
-          </form>
-
-          {sections.length === 0 ? (
-            <p className="meta" style={{ marginTop: '1rem' }}>
-              No chapters yet.
-            </p>
-          ) : (
-            <ul className="history-list" style={{ marginTop: '1rem' }}>
-              {sections.map((s) => {
-                const done =
-                  s.totalUnits != null && s.totalUnits > 0
-                    ? s.completedUnits >= s.totalUnits
-                    : s.completedUnits > 0
-                return (
-                  <li key={s.id}>
-                    <strong>{s.name}</strong>
-                    <p className="meta">
-                      {done
-                        ? 'Marked done'
-                        : s.totalUnits != null
-                          ? `${s.completedUnits} of ${s.totalUnits}`
-                          : s.completedUnits > 0
-                            ? 'In progress'
-                            : 'Not started'}
-                    </p>
-                    <div className="btn-row">
-                      <button
-                        type="button"
-                        className="btn btn-secondary"
-                        onClick={async () => {
-                          const target =
-                            s.totalUnits != null && s.totalUnits > 0
-                              ? s.totalUnits
-                              : Math.max(1, s.completedUnits || 1)
-                          await window.studyHub.upsertSection({
-                            id: s.id,
-                            resourceId: resource.id,
-                            name: s.name,
-                            completedUnits: done ? 0 : target,
-                            totalUnits: s.totalUnits
-                          })
-                          setSections(await window.studyHub.listSections(resource.id))
-                          showStatus(done ? 'Chapter unmarked.' : 'Chapter marked done.')
-                          onChanged()
-                        }}
-                      >
-                        {done ? 'Mark not done' : 'Mark chapter done'}
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-ghost"
-                        onClick={async () => {
-                          const patch = applySectionAsCurrent(resource, s.name)
-                          const updated = await window.studyHub.updateResource(resource.id, patch)
-                          setResource(updated)
-                          showStatus(`Current position set to “${s.name}”.`)
-                          setTab('progress')
-                          onChanged()
-                        }}
-                      >
-                        Use in Progress
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-danger"
-                        onClick={async () => {
-                          if (!window.confirm(`Remove “${s.name}”?`)) return
-                          await window.studyHub.deleteSection(s.id)
-                          setSections(await window.studyHub.listSections(resource.id))
-                          showStatus('Chapter removed.')
-                        }}
-                      >
-                        Remove
-                      </button>
-                    </div>
-                  </li>
-                )
-              })}
-            </ul>
-          )}
-        </section>
+      {tab === 'chapters' && resourceHasItemsTab(resource) && (
+        <ItemsTabPanel
+          resource={resource}
+          sections={sections}
+          sectionName={sectionName}
+          setSectionName={setSectionName}
+          setSections={setSections}
+          setResource={setResource}
+          setTab={setTab}
+          showStatus={showStatus}
+          onChanged={onChanged}
+        />
       )}
 
       {tab === 'history' && (
@@ -706,6 +903,173 @@ export default function ResourceDetailsScreen({
   )
 }
 
+function ItemsTabPanel({
+  resource,
+  sections,
+  sectionName,
+  setSectionName,
+  setSections,
+  setResource,
+  setTab,
+  showStatus,
+  onChanged
+}: {
+  resource: Resource
+  sections: ResourceSection[]
+  sectionName: string
+  setSectionName: (v: string) => void
+  setSections: (s: ResourceSection[]) => void
+  setResource: (r: Resource) => void
+  setTab: (t: TabId) => void
+  showStatus: (message: string, tone?: 'ok' | 'warn') => void
+  onChanged: () => void
+}) {
+  const label = itemsTabLabel(resource)
+  const noun = itemsTabNoun(resource)
+  const isCustomItems =
+    resource.type === 'custom' &&
+    ((resource.config as CustomConfig).mode === 'checklist' ||
+      (resource.config as CustomConfig).mode === 'milestones')
+
+  return (
+    <section className="panel" role="tabpanel" id="panel-chapters" aria-labelledby="tab-chapters">
+      <div className="section-head">
+        <div>
+          <h2>{label}</h2>
+          <p>
+            {isCustomItems
+              ? `Define each ${noun.singular} here. The Overview bar uses these items. On Progress, check them off or mark partial completion with a comment.`
+              : `Source of truth for ${noun.singular} completion. Mark done here, or select linked ${noun.plural} on Progress to raise the Overview bar.`}
+          </p>
+        </div>
+      </div>
+
+      <form
+        className="form-grid"
+        onSubmit={async (e) => {
+          e.preventDefault()
+          if (!sectionName.trim()) return
+          await window.studyHub.upsertSection({
+            resourceId: resource.id,
+            name: sectionName.trim(),
+            totalUnits: 1,
+            completedUnits: 0
+          })
+          setSectionName('')
+          setSections(await window.studyHub.listSections(resource.id))
+          showStatus(`${noun.singular[0].toUpperCase()}${noun.singular.slice(1)} added.`)
+          onChanged()
+        }}
+      >
+        <label>
+          {isCustomItems ? `${label.slice(0, -1)} name` : 'Chapter or section name'}
+          <input
+            type="text"
+            name="sectionName"
+            autoComplete="off"
+            value={sectionName}
+            onChange={(e) => setSectionName(e.target.value)}
+            placeholder={
+              isCustomItems
+                ? (resource.config as CustomConfig).mode === 'milestones'
+                  ? 'Finish practice exam 1'
+                  : 'Review amino acids'
+                : 'Chapter 4 — Cell membranes'
+            }
+          />
+        </label>
+        <p className="helper-text">
+          {isCustomItems
+            ? `Add every ${noun.singular} you want on the bar. Progress updates check them off without redefining the list.`
+            : 'Tip: name it the way you talk about it. On Progress, select one or more listed chapters to mark them read/complete.'}
+        </p>
+        <div className="btn-row">
+          <button type="submit" className="btn btn-primary">
+            {noun.addButton}
+          </button>
+        </div>
+      </form>
+
+      {sections.length === 0 ? (
+        <p className="meta" style={{ marginTop: '1rem' }}>
+          No {noun.plural} yet.
+        </p>
+      ) : (
+        <ul className="history-list" style={{ marginTop: '1rem' }}>
+          {sections.map((s) => {
+            const done = isChapterMarkedDone(s)
+            const partial = !done && s.completedUnits > 0
+            return (
+              <li key={s.id}>
+                <strong>{s.name}</strong>
+                <p className="meta">
+                  {done ? 'Completed' : partial ? 'Partial' : 'Not completed'}
+                  {s.notes?.trim() ? ` · ${s.notes.trim()}` : ''}
+                </p>
+                <div className="btn-row">
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    onClick={async () => {
+                      const unitTotal = s.totalUnits != null && s.totalUnits > 0 ? s.totalUnits : 1
+                      await window.studyHub.upsertSection({
+                        id: s.id,
+                        resourceId: resource.id,
+                        name: s.name,
+                        completedUnits: done ? 0 : unitTotal,
+                        totalUnits: unitTotal,
+                        notes: s.notes
+                      })
+                      setSections(await window.studyHub.listSections(resource.id))
+                      showStatus(
+                        done
+                          ? `${noun.singular[0].toUpperCase()}${noun.singular.slice(1)} unmarked — completion decreased.`
+                          : `${noun.singular[0].toUpperCase()}${noun.singular.slice(1)} marked done — completion increased.`
+                      )
+                      onChanged()
+                    }}
+                  >
+                    {done ? 'Mark not done' : `Mark ${noun.singular} done`}
+                  </button>
+                  {!isCustomItems && (
+                    <button
+                      type="button"
+                      className="btn btn-ghost"
+                      onClick={async () => {
+                        const patch = applySectionAsCurrent(resource, s.name)
+                        const updated = await window.studyHub.updateResource(resource.id, patch)
+                        setResource(updated)
+                        showStatus(`Current position set to “${s.name}”.`)
+                        setTab('progress')
+                        onChanged()
+                      }}
+                    >
+                      Use in Progress
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="btn btn-danger"
+                    onClick={async () => {
+                      if (!window.confirm(`Remove “${s.name}”?`)) return
+                      await window.studyHub.deleteSection(s.id)
+                      setSections(await window.studyHub.listSections(resource.id))
+                      showStatus(`${noun.singular[0].toUpperCase()}${noun.singular.slice(1)} removed.`)
+                      onChanged()
+                    }}
+                  >
+                    Remove
+                  </button>
+                </div>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </section>
+  )
+}
+
 function applySectionAsCurrent(resource: Resource, sectionName: string): { config: ResourceConfig } {
   if (resource.type === 'textbook') {
     const c = resource.config as TextbookConfig
@@ -722,7 +1086,11 @@ function emptyProgressDraft(resource: Resource): ResourceConfig {
   const base = resource.config
   if (resource.type === 'textbook') {
     const c = base as TextbookConfig
-    return { ...c, currentChapter: '', currentPage: undefined }
+    return {
+      ...c,
+      currentChapter: '',
+      currentPage: undefined
+    }
   }
   if (resource.type === 'video') {
     const c = base as VideoConfig
@@ -730,11 +1098,22 @@ function emptyProgressDraft(resource: Resource): ResourceConfig {
   }
   if (resource.type === 'anki') {
     const c = base as AnkiConfig
-    return { ...c, lastSessionMinutes: undefined, lastNewCards: undefined }
+    return {
+      ...c,
+      lastSessionMinutes: undefined,
+      lastNewCards: undefined,
+      cardsAttempted: undefined as unknown as number,
+      cardsCorrect: undefined
+    }
   }
   if (resource.type === 'question_bank') {
     const c = base as QuestionBankConfig
-    return { ...c, questionsAttempted: undefined as unknown as number, correctAnswers: null }
+    return {
+      ...c,
+      questionsAttempted: undefined as unknown as number,
+      correctAnswers: null,
+      incorrectAnswers: null
+    }
   }
   if (resource.type === 'custom') {
     const c = base as CustomConfig
@@ -745,64 +1124,86 @@ function emptyProgressDraft(resource: Resource): ResourceConfig {
   return base
 }
 
-function mergeProgressConfig(resource: Resource, draft: ResourceConfig): ResourceConfig {
-  const prev = resource.config
-  if (resource.type === 'textbook') {
-    const d = draft as TextbookConfig
-    const p = prev as TextbookConfig
-    return {
-      ...p,
-      ...d,
-      currentChapter: d.currentChapter?.trim() ? d.currentChapter : p.currentChapter,
-      currentPage: d.currentPage != null && !Number.isNaN(d.currentPage) ? d.currentPage : p.currentPage
+type ItemSessionAction = 'none' | 'done' | 'partial'
+
+/** Compact multi-select: one closed control, checklist inside a dropdown panel. */
+function ChapterChecklistDropdown({
+  sections,
+  selectedIds,
+  onToggle
+}: {
+  sections: ResourceSection[]
+  selectedIds: string[]
+  onToggle: (id: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e: MouseEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false)
     }
-  }
-  if (resource.type === 'video') {
-    const d = draft as VideoConfig
-    const p = prev as VideoConfig
-    return {
-      ...p,
-      ...d,
-      currentLesson: d.currentLesson?.trim() ? d.currentLesson : p.currentLesson,
-      timestampSeconds:
-        d.timestampSeconds != null && d.timestampSeconds > 0 ? d.timestampSeconds : p.timestampSeconds
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false)
     }
-  }
-  if (resource.type === 'anki') {
-    const d = draft as AnkiConfig
-    const p = prev as AnkiConfig
-    return {
-      ...p,
-      lastSessionMinutes: d.lastSessionMinutes,
-      lastNewCards: d.lastNewCards,
-      reviewSessionsThisWeek: (p.reviewSessionsThisWeek ?? 0) + 1
+    document.addEventListener('mousedown', onDoc)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDoc)
+      document.removeEventListener('keydown', onKey)
     }
-  }
-  if (resource.type === 'question_bank') {
-    const d = draft as QuestionBankConfig
-    const p = prev as QuestionBankConfig
-    const attempted = d.questionsAttempted
-    if (attempted == null || Number.isNaN(Number(attempted))) return { ...p, ...d, questionsAttempted: p.questionsAttempted }
-    return { ...p, ...d, questionsAttempted: Number(attempted) }
-  }
-  if (resource.type === 'custom') {
-    const d = draft as CustomConfig
-    const p = prev as CustomConfig
-    if (d.mode === 'units') {
-      const units = d.completedUnits
-      if (units == null || Number.isNaN(Number(units))) {
-        return { ...p, ...d, completedUnits: p.completedUnits }
-      }
-    }
-    if (d.mode === 'time') {
-      const mins = d.timeSpentMinutes
-      if (mins == null || Number.isNaN(Number(mins))) {
-        return { ...p, ...d, timeSpentMinutes: p.timeSpentMinutes }
-      }
-    }
-    return { ...p, ...d }
-  }
-  return draft
+  }, [open])
+
+  const selected = sections.filter((s) => selectedIds.includes(s.id))
+  const summary =
+    selected.length === 0
+      ? 'Select chapter(s)…'
+      : selected.length <= 2
+        ? selected.map((s) => s.name).join(', ')
+        : `${selected.length} chapters selected`
+
+  return (
+    <div className="dropdown-checklist" ref={rootRef}>
+      <span className="field-label" id="chapters-read-label">
+        Chapters read this session
+      </span>
+      <button
+        type="button"
+        className="dropdown-checklist-trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-labelledby="chapters-read-label"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="dropdown-checklist-summary">{summary}</span>
+        <span className="dropdown-checklist-caret" aria-hidden>
+          ▾
+        </span>
+      </button>
+      {open && (
+        <div className="dropdown-checklist-menu" role="listbox" aria-multiselectable="true">
+          {sections.map((s) => {
+            const checked = selectedIds.includes(s.id)
+            const done = isChapterMarkedDone(s)
+            return (
+              <label key={s.id} className="dropdown-checklist-option check-row">
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => onToggle(s.id)}
+                />
+                <span>
+                  {s.name}
+                  {done ? ' (already done)' : ''}
+                </span>
+              </label>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
 }
 
 function ProgressEditor({
@@ -818,27 +1219,45 @@ function ProgressEditor({
     config: ResourceConfig,
     extras: { stoppingPointNote?: string; nextAction?: string },
     summary: string,
-    hist: { studiedPart?: string; details?: string; studyAreaIds?: string[]; sectionId?: string },
-    queueWhen: { today: boolean; tomorrow: boolean }
+    hist: {
+      studiedPart?: string
+      details?: string
+      studyAreaIds?: string[]
+      sectionId?: string
+      sectionIds?: string[]
+    },
+    schedule: NextActionSchedule
   ) => Promise<void>
 }) {
   const [config, setConfig] = useState(() => emptyProgressDraft(resource))
   const [stopping, setStopping] = useState('')
   const [nextAction, setNextAction] = useState('')
   const [sectionId, setSectionId] = useState('')
-  const [queueToday, setQueueToday] = useState(false)
-  const [queueTomorrow, setQueueTomorrow] = useState(false)
+  const [selectedSectionIds, setSelectedSectionIds] = useState<string[]>([])
+  const [markSelectedDone, setMarkSelectedDone] = useState(false)
+  const [formError, setFormError] = useState('')
+  const [itemActions, setItemActions] = useState<Record<string, ItemSessionAction>>({})
+  const [itemComments, setItemComments] = useState<Record<string, string>>({})
+  const [scheduleMode, setScheduleMode] = useState<'none' | 'today' | 'tomorrow' | 'date' | 'range'>('none')
+  const [pickDate, setPickDate] = useState(() => formatYmd(new Date()))
+  const [rangeEnd, setRangeEnd] = useState(() => {
+    const d = new Date()
+    d.setDate(d.getDate() + 1)
+    return formatYmd(d)
+  })
   const [timestampText, setTimestampText] = useState('')
-  const [draftItem, setDraftItem] = useState('')
 
   const resetForm = () => {
     setConfig(emptyProgressDraft(resource))
     setSectionId('')
+    setSelectedSectionIds([])
+    setMarkSelectedDone(false)
+    setFormError('')
+    setItemActions({})
+    setItemComments({})
     setStopping('')
     setNextAction('')
-    setQueueToday(false)
-    setQueueTomorrow(false)
-    setDraftItem('')
+    setScheduleMode('none')
     setTimestampText('')
   }
 
@@ -852,13 +1271,7 @@ function ProgressEditor({
     if (!sectionId) return
     const section = sections.find((s) => s.id === sectionId)
     if (!section) return
-    if (resource.type === 'textbook') {
-      const c = config as TextbookConfig
-      setConfig({
-        ...c,
-        currentChapter: section.name.replace(/^chapter\s+/i, '') || section.name
-      })
-    } else if (resource.type === 'video') {
+    if (resource.type === 'video') {
       const c = config as VideoConfig
       setConfig({
         ...c,
@@ -867,14 +1280,21 @@ function ProgressEditor({
     }
   }, [sectionId])
 
+  const toggleSelectedSection = (id: string) => {
+    setSelectedSectionIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    )
+    setFormError('')
+  }
+
   const areaAndChapterFields = (
     <>
-      {sections.length > 0 && (
+      {sections.length > 0 && resource.type !== 'textbook' && (
         <div>
           <label>
             Chapter / section studied (optional)
             <select value={sectionId} onChange={(e) => setSectionId(e.target.value)}>
-              <option value="">Type chapter below instead</option>
+              <option value="">None</option>
               {sections.map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.name}
@@ -882,44 +1302,58 @@ function ProgressEditor({
               ))}
             </select>
           </label>
-          <p className="helper-text">
-            Optional list from this resource’s Chapters tab. Choosing one records that chapter in history. Categories
-            on the resource (Overview) organize My Resources — not chapter-level tags.
-          </p>
         </div>
       )}
     </>
   )
 
+  const buildSchedule = (): NextActionSchedule => {
+    if (scheduleMode === 'today') return { mode: 'today' }
+    if (scheduleMode === 'tomorrow') return { mode: 'tomorrow' }
+    if (scheduleMode === 'date') return { mode: 'date', startDate: pickDate }
+    if (scheduleMode === 'range') return { mode: 'range', startDate: pickDate, endDate: rangeEnd }
+    return { mode: 'none' }
+  }
+
   const queueToggles = (
-    <div>
-      <p className="field-label">Add next action to queue when you save</p>
-      <div className="chip-row" role="group" aria-label="Queue next action">
-        <button
-          type="button"
-          className={`chip chip-queue${queueToday ? ' is-selected' : ''}`}
-          aria-pressed={queueToday}
-          onClick={() => setQueueToday((v) => !v)}
+    <div className="next-action-schedule">
+      <p className="field-label">Next action — add to queue when you save</p>
+      <label>
+        When
+        <select
+          value={scheduleMode}
+          onChange={(e) =>
+            setScheduleMode(e.target.value as 'none' | 'today' | 'tomorrow' | 'date' | 'range')
+          }
+          name="next-action-when"
         >
-          Today
-        </button>
-        <button
-          type="button"
-          className={`chip chip-queue${queueTomorrow ? ' is-selected' : ''}`}
-          aria-pressed={queueTomorrow}
-          onClick={() => setQueueTomorrow((v) => !v)}
-        >
-          Tomorrow
-        </button>
-      </div>
+          <option value="none">Don’t add to queue</option>
+          <option value="today">Today</option>
+          <option value="tomorrow">Tomorrow</option>
+          <option value="date">Pick a date</option>
+          <option value="range">Several days (date range)</option>
+        </select>
+      </label>
+      {(scheduleMode === 'date' || scheduleMode === 'range') && (
+        <label>
+          {scheduleMode === 'range' ? 'From date' : 'Date'}
+          <input type="date" value={pickDate} onChange={(e) => setPickDate(e.target.value)} required />
+        </label>
+      )}
+      {scheduleMode === 'range' && (
+        <label>
+          Through date
+          <input type="date" value={rangeEnd} onChange={(e) => setRangeEnd(e.target.value)} required />
+        </label>
+      )}
       <p className="meta" style={{ margin: '0.35rem 0 0' }}>
-        Toggle Today and/or Tomorrow (color shows selected), then Save. Needs a next action above.
+        Needs a next action above. Chosen dates land on the Today queue tabs for those days.
       </p>
     </div>
   )
 
   const histAreas = selectedAreaIds
-  const queueWhen = { today: queueToday, tomorrow: queueTomorrow }
+  const queueWhen = buildSchedule()
 
   if (resource.type === 'textbook') {
     const c = config as TextbookConfig
@@ -928,40 +1362,113 @@ function ProgressEditor({
         className="form-grid"
         onSubmit={async (e) => {
           e.preventDefault()
-          const nextConfig = mergeProgressConfig(resource, c) as TextbookConfig
-          const section = sections.find((s) => s.id === sectionId)
+          const markError = readingMarkDoneValidation(markSelectedDone, selectedSectionIds, sections)
+          if (markError) {
+            setFormError(markError)
+            return
+          }
+          if (markSelectedDone) {
+            for (const id of selectedSectionIds) {
+              const s = sections.find((row) => row.id === id)
+              if (!s) continue
+              const unitTotal = s.totalUnits != null && s.totalUnits > 0 ? s.totalUnits : 1
+              await window.studyHub.upsertSection({
+                id: s.id,
+                resourceId: resource.id,
+                name: s.name,
+                completedUnits: unitTotal,
+                totalUnits: unitTotal,
+                notes: s.notes
+              })
+            }
+          }
+          const linked = selectedSectionIds
+            .map((id) => sections.find((s) => s.id === id))
+            .filter((s): s is ResourceSection => Boolean(s))
+          const lastLinked = linked[linked.length - 1]
+          const nextConfig = mergeProgressConfig(resource, {
+            ...c,
+            currentChapter:
+              c.currentChapter?.trim() ||
+              (lastLinked
+                ? lastLinked.name.replace(/^chapter\s+/i, '') || lastLinked.name
+                : c.currentChapter)
+          }) as TextbookConfig
           const studied =
-            section?.name || studiedPartLabel({ type: 'textbook', config: nextConfig })
-          const note = stopping || studied
+            linked.length > 0
+              ? linked.map((s) => s.name).join(', ')
+              : studiedPartLabel({ type: 'textbook', config: nextConfig })
+          const note =
+            stopping ||
+            (markSelectedDone && linked.length
+              ? `Read: ${studied}`
+              : studied)
           const action = nextAction || (note ? `Continue ${resource.name}: ${note}.` : '')
           await onSave(
             nextConfig,
             { stoppingPointNote: note, nextAction: action },
-            `Updated reading — ${studied}`,
+            markSelectedDone && linked.length
+              ? `Marked read — ${studied}`
+              : `Updated reading — ${studied}`,
             {
               studiedPart: studied,
               details: note,
               studyAreaIds: histAreas,
-              sectionId: sectionId || undefined
+              sectionId: linked[0]?.id,
+              sectionIds: linked.map((s) => s.id)
             },
             queueWhen
           )
           resetForm()
         }}
       >
-        {areaAndChapterFields}
+        <p className="helper-text">
+          Select <strong>which chapter(s) you read</strong> from the Chapters tab list. Checking “Mark selected as
+          completed” is the only way Progress raises the completion count — and it requires at least one linked
+          chapter.
+        </p>
+        {sections.length === 0 ? (
+          <div className="panel-warn" role="status">
+            No chapters listed yet. Add them on the <strong>Chapters</strong> tab before you can increase the
+            completion count.
+          </div>
+        ) : (
+          <ChapterChecklistDropdown
+            sections={sections}
+            selectedIds={selectedSectionIds}
+            onToggle={toggleSelectedSection}
+          />
+        )}
+        <label className="check-row">
+          <input
+            type="checkbox"
+            checked={markSelectedDone}
+            onChange={(e) => {
+              setMarkSelectedDone(e.target.checked)
+              setFormError('')
+            }}
+            disabled={sections.length === 0}
+          />
+          <span>Mark selected chapter(s) as completed (raises Overview count)</span>
+        </label>
+        {formError && (
+          <div className="panel-warn" role="alert">
+            {formError}
+          </div>
+        )}
         {c.trackChapters && (
           <label>
-            Chapter
+            Stopping point — chapter (optional)
             <input
               value={c.currentChapter ?? ''}
               onChange={(e) => setConfig({ ...c, currentChapter: e.target.value })}
+              placeholder="Where you left off"
             />
           </label>
         )}
         {c.trackPages && (
           <label>
-            Page
+            Stopping point — page (optional)
             <input
               type="number"
               min={1}
@@ -1081,6 +1588,37 @@ function ProgressEditor({
         }}
       >
         {areaAndChapterFields}
+        <p className="helper-text">
+          Session counts are <strong>added</strong> to Overview totals. Bar = correct ÷ attempted (cumulative).
+        </p>
+        <label>
+          Cards attempted this session
+          <input
+            type="number"
+            min={0}
+            value={c.cardsAttempted ?? ''}
+            onChange={(e) =>
+              setConfig({
+                ...c,
+                cardsAttempted: e.target.value ? Number(e.target.value) : (undefined as unknown as number)
+              })
+            }
+          />
+        </label>
+        <label>
+          Cards correct this session
+          <input
+            type="number"
+            min={0}
+            value={c.cardsCorrect ?? ''}
+            onChange={(e) =>
+              setConfig({
+                ...c,
+                cardsCorrect: e.target.value ? Number(e.target.value) : undefined
+              })
+            }
+          />
+        </label>
         <label>
           Minutes this session (optional)
           <input
@@ -1147,8 +1685,11 @@ function ProgressEditor({
         }}
       >
         {areaAndChapterFields}
+        <p className="helper-text">
+          Session counts are <strong>added</strong> to Overview totals. Bar = correct ÷ attempted (cumulative).
+        </p>
         <label>
-          Questions attempted
+          Questions attempted this session
           <input
             type="number"
             min={0}
@@ -1162,7 +1703,7 @@ function ProgressEditor({
           />
         </label>
         <label>
-          Correct answers (optional)
+          Correct this session
           <input
             type="number"
             min={0}
@@ -1171,6 +1712,20 @@ function ProgressEditor({
               setConfig({
                 ...c,
                 correctAnswers: e.target.value ? Number(e.target.value) : null
+              })
+            }
+          />
+        </label>
+        <label>
+          Incorrect this session (optional)
+          <input
+            type="number"
+            min={0}
+            value={c.incorrectAnswers ?? ''}
+            onChange={(e) =>
+              setConfig({
+                ...c,
+                incorrectAnswers: e.target.value ? Number(e.target.value) : null
               })
             }
           />
@@ -1188,6 +1743,171 @@ function ProgressEditor({
   }
 
   const c = config as CustomConfig
+  const storedCustom = resource.config as CustomConfig
+  const unitLabel = c.unitLabel || storedCustom.unitLabel || 'units'
+  const totalUnits = storedCustom.totalUnits
+  const itemsMode = storedCustom.mode === 'checklist' || storedCustom.mode === 'milestones'
+  const itemsLabel = itemsTabLabel(resource)
+  const itemsNoun = itemsTabNoun(resource)
+
+  if (itemsMode) {
+    return (
+      <form
+        className="form-grid"
+        onSubmit={async (e) => {
+          e.preventDefault()
+          const touched = sections.filter((s) => {
+            const action = itemActions[s.id] ?? 'none'
+            const comment = itemComments[s.id]?.trim()
+            return action !== 'none' || Boolean(comment)
+          })
+          if (!touched.length && !stopping.trim() && !nextAction.trim()) {
+            setFormError(`Select at least one ${itemsNoun.singular} to update, or add a note.`)
+            return
+          }
+          setFormError('')
+          const changedNames: string[] = []
+          for (const s of touched) {
+            const action = itemActions[s.id] ?? 'none'
+            const comment = itemComments[s.id]?.trim() ?? ''
+            const unitTotal = s.totalUnits != null && s.totalUnits > 0 ? s.totalUnits : 1
+            let completedUnits = s.completedUnits
+            let total = unitTotal
+            let notes = s.notes
+            if (action === 'done') {
+              completedUnits = unitTotal
+              total = unitTotal
+            } else if (action === 'partial') {
+              // Half-complete for the bar’s “done” count (not marked done), with comment.
+              total = Math.max(2, unitTotal === 1 ? 2 : unitTotal)
+              completedUnits = Math.max(1, Math.floor(total / 2))
+            }
+            if (comment) {
+              notes = comment
+            }
+            await window.studyHub.upsertSection({
+              id: s.id,
+              resourceId: resource.id,
+              name: s.name,
+              completedUnits,
+              totalUnits: total,
+              notes
+            })
+            changedNames.push(s.name)
+          }
+          const studied = changedNames.length ? changedNames.join(', ') : itemsLabel
+          const note =
+            stopping ||
+            (changedNames.length
+              ? `Updated ${changedNames.length} ${changedNames.length === 1 ? itemsNoun.singular : itemsNoun.plural}`
+              : summarizeProgress({ type: 'custom', config: storedCustom }))
+          await onSave(
+            storedCustom,
+            { stoppingPointNote: note, nextAction },
+            `${itemsLabel} progress — ${note}`,
+            {
+              studiedPart: studied,
+              details: note,
+              studyAreaIds: histAreas,
+              sectionId: touched[0]?.id,
+              sectionIds: touched.map((s) => s.id)
+            },
+            queueWhen
+          )
+          resetForm()
+        }}
+      >
+        <p className="helper-text">
+          Check off {itemsNoun.plural} defined on the <strong>{itemsLabel}</strong> tab, or mark partial with a
+          comment. The Overview bar uses those items.
+        </p>
+        {sections.length === 0 ? (
+          <div className="panel-warn" role="status">
+            No {itemsNoun.plural} yet. Add them on the <strong>{itemsLabel}</strong> tab first.
+          </div>
+        ) : (
+          <ul className="history-list" style={{ margin: 0 }}>
+            {sections.map((s) => {
+              const done = isChapterMarkedDone(s)
+              const action = itemActions[s.id] ?? 'none'
+              return (
+                <li key={s.id}>
+                  <strong>
+                    {s.name}
+                    {done ? ' · done' : s.completedUnits > 0 ? ' · partial' : ''}
+                  </strong>
+                  {s.notes?.trim() ? <p className="meta">{s.notes.trim()}</p> : null}
+                  <div className="btn-row" style={{ marginTop: '0.35rem' }}>
+                    <label className="check-row">
+                      <input
+                        type="radio"
+                        name={`item-action-${s.id}`}
+                        checked={action === 'none'}
+                        onChange={() =>
+                          setItemActions((prev) => ({ ...prev, [s.id]: 'none' }))
+                        }
+                      />
+                      <span>No change</span>
+                    </label>
+                    <label className="check-row">
+                      <input
+                        type="radio"
+                        name={`item-action-${s.id}`}
+                        checked={action === 'done'}
+                        onChange={() =>
+                          setItemActions((prev) => ({ ...prev, [s.id]: 'done' }))
+                        }
+                      />
+                      <span>Complete</span>
+                    </label>
+                    <label className="check-row">
+                      <input
+                        type="radio"
+                        name={`item-action-${s.id}`}
+                        checked={action === 'partial'}
+                        onChange={() =>
+                          setItemActions((prev) => ({ ...prev, [s.id]: 'partial' }))
+                        }
+                      />
+                      <span>Partial</span>
+                    </label>
+                  </div>
+                  <label>
+                    Comment (optional)
+                    <input
+                      value={itemComments[s.id] ?? ''}
+                      onChange={(e) =>
+                        setItemComments((prev) => ({ ...prev, [s.id]: e.target.value }))
+                      }
+                      placeholder="What you finished or what’s left"
+                    />
+                  </label>
+                </li>
+              )
+            })}
+          </ul>
+        )}
+        {formError && (
+          <div className="panel-warn" role="alert">
+            {formError}
+          </div>
+        )}
+        <label>
+          Session note (optional)
+          <input value={stopping} onChange={(e) => setStopping(e.target.value)} />
+        </label>
+        <label>
+          Next action (optional)
+          <input value={nextAction} onChange={(e) => setNextAction(e.target.value)} />
+        </label>
+        {queueToggles}
+        <button type="submit" className="btn btn-primary">
+          Save {itemsLabel.toLowerCase()} progress
+        </button>
+      </form>
+    )
+  }
+
   return (
     <form
       className="form-grid"
@@ -1212,21 +1932,53 @@ function ProgressEditor({
       }}
     >
       {areaAndChapterFields}
-      <label>
-        Completed units
-        <input
-          type="number"
-          min={0}
-          value={c.completedUnits ?? ''}
-          onChange={(e) =>
-            setConfig({
-              ...c,
-              mode: 'units',
-              completedUnits: e.target.value ? Number(e.target.value) : (undefined as unknown as number)
-            })
-          }
-        />
-      </label>
+      {(c.mode === 'units' || storedCustom.mode === 'units') && (
+        <>
+          <p className="helper-text">
+            Session units are <strong>added</strong> to Overview totals
+            {totalUnits != null && totalUnits > 0
+              ? ` (currently ${storedCustom.completedUnits ?? 0} of ${totalUnits} ${unitLabel}).`
+              : '. Set total units on Overview so the completion bar can show done ÷ total.'}
+          </p>
+          {!(totalUnits != null && totalUnits > 0) && (
+            <div className="panel-warn" role="status">
+              No total units set yet. Open <strong>Overview</strong> and enter total units to enable the progress bar.
+            </div>
+          )}
+          <label>
+            Units completed this session
+            <input
+              type="number"
+              min={0}
+              value={c.completedUnits ?? ''}
+              onChange={(e) =>
+                setConfig({
+                  ...c,
+                  mode: 'units',
+                  completedUnits: e.target.value ? Number(e.target.value) : (undefined as unknown as number)
+                })
+              }
+            />
+          </label>
+        </>
+      )}
+      {storedCustom.mode === 'time' && (
+        <label>
+          Minutes this session
+          <input
+            type="number"
+            min={0}
+            value={c.timeSpentMinutes ?? ''}
+            onChange={(e) =>
+              setConfig({
+                ...c,
+                mode: 'time',
+                timeSpentMinutes: e.target.value ? Number(e.target.value) : (undefined as unknown as number)
+              })
+            }
+          />
+        </label>
+      )}
       <label>
         Next action (optional)
         <input value={nextAction} onChange={(e) => setNextAction(e.target.value)} />
@@ -1235,46 +1987,6 @@ function ProgressEditor({
       <button type="submit" className="btn btn-primary">
         Save practice progress
       </button>
-      {c.mode === 'checklist' && (
-        <div className="form-grid">
-          {(c.checklist ?? []).map((item) => (
-            <label key={item.id} className="check-row">
-              <input
-                type="checkbox"
-                checked={item.done}
-                onChange={(e) => {
-                  const items = (c.checklist ?? []).map((i) =>
-                    i.id === item.id ? { ...i, done: e.target.checked } : i
-                  )
-                  setConfig({ ...c, checklist: items })
-                }}
-              />
-              <span>{item.label}</span>
-            </label>
-          ))}
-          <label>
-            Add checklist item
-            <input value={draftItem} onChange={(e) => setDraftItem(e.target.value)} />
-          </label>
-          <button
-            type="button"
-            className="btn btn-ghost"
-            onClick={() => {
-              if (!draftItem.trim()) return
-              setConfig({
-                ...c,
-                checklist: [
-                  ...(c.checklist ?? []),
-                  { id: crypto.randomUUID(), label: draftItem.trim(), done: false }
-                ]
-              })
-              setDraftItem('')
-            }}
-          >
-            Add item
-          </button>
-        </div>
-      )}
     </form>
   )
 }

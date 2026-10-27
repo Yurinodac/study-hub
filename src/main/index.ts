@@ -1,8 +1,12 @@
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
-import { join } from 'path'
-import { existsSync, writeFileSync, readFileSync } from 'fs'
-import type { BackupPayload, OpenResourceResult, ResourceType } from '../shared/types'
+import { join, extname } from 'path'
+import { existsSync, writeFileSync, readFileSync, mkdirSync, copyFileSync, unlinkSync } from 'fs'
+import { pathToFileURL } from 'url'
+import type { BackupPayload, LocationKind, OpenResourceResult, ResourceType } from '../shared/types'
 import { SCHEMA_VERSION } from '../shared/types'
+
+const CELEBRATION_META_KEY = 'celebrationImageRelPath'
+const CELEBRATION_DIR = 'celebration'
 
 // Register early so native-module failures can surface a dialog instead of a silent exit.
 process.on('uncaughtException', (error) => {
@@ -24,6 +28,12 @@ import * as db from './database'
 import { hasSampleData, loadSampleData } from './sample-data'
 
 let mainWindow: BrowserWindow | null = null
+
+const COMMON_ANKI_PATHS = [
+  join(process.env.LOCALAPPDATA || '', 'Programs', 'Anki', 'anki.exe'),
+  join(process.env.ProgramFiles || 'C:\\Program Files', 'Anki', 'anki.exe'),
+  join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Anki', 'anki.exe')
+]
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -52,8 +62,27 @@ function userDataPath(): string {
   return app.getPath('userData')
 }
 
+function celebrationAbsPath(): string | null {
+  const rel = db.getMeta(CELEBRATION_META_KEY)
+  if (!rel) return null
+  const abs = join(userDataPath(), rel)
+  return existsSync(abs) ? abs : null
+}
+
+function getCelebrationSettings(): { imagePath: string; hasCustomImage: boolean; imageUrl: string | null } {
+  const abs = celebrationAbsPath()
+  if (!abs) {
+    return { imagePath: '', hasCustomImage: false, imageUrl: null }
+  }
+  return {
+    imagePath: abs,
+    hasCustomImage: true,
+    imageUrl: pathToFileURL(abs).href
+  }
+}
+
 async function openResourceLocation(
-  kind: 'url' | 'file' | 'none',
+  kind: LocationKind,
   value: string
 ): Promise<OpenResourceResult> {
   const trimmed = value.trim()
@@ -86,6 +115,26 @@ async function openResourceLocation(
     }
   }
 
+  if (kind === 'app') {
+    if (!existsSync(trimmed)) {
+      return {
+        ok: false,
+        message:
+          'That app could not be found. Browse to anki.exe (or another app) in resource details, or install Anki first.',
+        needsUpdateLocation: true
+      }
+    }
+    const err = await shell.openPath(trimmed)
+    if (err) {
+      return {
+        ok: false,
+        message: `Windows could not open that app (${err}). Try updating the location.`,
+        needsUpdateLocation: true
+      }
+    }
+    return { ok: true }
+  }
+
   // file
   if (!existsSync(trimmed)) {
     return {
@@ -103,6 +152,13 @@ async function openResourceLocation(
     }
   }
   return { ok: true }
+}
+
+function findAnkiExe(): string | null {
+  for (const p of COMMON_ANKI_PATHS) {
+    if (p && existsSync(p)) return p
+  }
+  return null
 }
 
 function registerIpc(): void {
@@ -147,6 +203,21 @@ function registerIpc(): void {
     db.deletePracticeExam(id)
   })
 
+  ipcMain.handle('missed:list', (_e, examId: string) => db.listMissedQuestions(examId))
+  ipcMain.handle('missed:listRotation', (_e, projectId: string) =>
+    db.listMissedQuestionsInRotation(projectId)
+  )
+  ipcMain.handle('missed:upsert', (_e, input) => db.upsertMissedQuestion(input))
+  ipcMain.handle('missed:setConfidence', (_e, id: string, confidence: number) =>
+    db.updateMissedQuestionConfidence(id, confidence)
+  )
+  ipcMain.handle('missed:setRotation', (_e, id: string, inRotation: boolean) =>
+    db.setMissedQuestionInRotation(id, inRotation)
+  )
+  ipcMain.handle('missed:delete', (_e, id: string) => {
+    db.deleteMissedQuestion(id)
+  })
+
   ipcMain.handle(
     'resources:list',
     (
@@ -177,9 +248,10 @@ function registerIpc(): void {
       historyExtras?: import('../shared/types').HistoryExtras
     ) => db.updateResource(id, patch, historySummary, historyExtras)
   )
-  ipcMain.handle('resources:open', async (_e, kind: 'url' | 'file' | 'none', value: string) =>
+  ipcMain.handle('resources:open', async (_e, kind: LocationKind, value: string) =>
     openResourceLocation(kind, value)
   )
+  ipcMain.handle('resources:findAnki', () => findAnkiExe())
 
   ipcMain.handle('sections:list', (_e, resourceId: string, studyAreaId?: string | null) =>
     db.listSections(resourceId, studyAreaId)
@@ -195,7 +267,11 @@ function registerIpc(): void {
 
   ipcMain.handle('queue:list', (_e, projectId: string) => db.listQueue(projectId))
   ipcMain.handle('queue:listTomorrow', (_e, projectId: string) => db.listTomorrowQueue(projectId))
+  ipcMain.handle('queue:listForDate', (_e, projectId: string, forDate: string) =>
+    db.listQueueForDate(projectId, forDate)
+  )
   ipcMain.handle('queue:add', (_e, input) => db.addQueueItem(input))
+  ipcMain.handle('queue:addDates', (_e, input) => db.addQueueItemsForDates(input))
   ipcMain.handle('queue:update', (_e, id: string, patch) => {
     db.updateQueueItem(id, patch)
   })
@@ -213,6 +289,45 @@ function registerIpc(): void {
     return true
   })
   ipcMain.handle('sample:remove', (_e, projectId: string) => db.removeSampleData(projectId))
+
+  ipcMain.handle('celebration:get', () => getCelebrationSettings())
+  ipcMain.handle('celebration:pick', async () => {
+    const result = await dialog.showOpenDialog(mainWindow!, {
+      title: 'Choose a celebration image',
+      properties: ['openFile'],
+      filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }]
+    })
+    if (result.canceled || !result.filePaths[0]) return getCelebrationSettings()
+    const src = result.filePaths[0]
+    const dir = join(userDataPath(), CELEBRATION_DIR)
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+    const destName = `celebrate${extname(src).toLowerCase() || '.png'}`
+    const dest = join(dir, destName)
+    // Replace previous custom image files in the folder.
+    try {
+      for (const old of ['celebrate.png', 'celebrate.jpg', 'celebrate.jpeg', 'celebrate.gif', 'celebrate.webp']) {
+        const p = join(dir, old)
+        if (existsSync(p) && p !== dest) unlinkSync(p)
+      }
+    } catch {
+      /* ignore */
+    }
+    copyFileSync(src, dest)
+    db.setMeta(CELEBRATION_META_KEY, join(CELEBRATION_DIR, destName))
+    return getCelebrationSettings()
+  })
+  ipcMain.handle('celebration:clear', () => {
+    const abs = celebrationAbsPath()
+    if (abs && existsSync(abs)) {
+      try {
+        unlinkSync(abs)
+      } catch {
+        /* ignore */
+      }
+    }
+    db.setMeta(CELEBRATION_META_KEY, '')
+    return getCelebrationSettings()
+  })
 
   ipcMain.handle('backup:export', async () => {
     const payload = db.exportBackup()
@@ -264,6 +379,19 @@ function registerIpc(): void {
     const result = await dialog.showOpenDialog(mainWindow!, {
       title: 'Choose a study file',
       properties: ['openFile']
+    })
+    if (result.canceled || !result.filePaths[0]) return null
+    return result.filePaths[0]
+  })
+
+  ipcMain.handle('dialog:pickApp', async () => {
+    const result = await dialog.showOpenDialog(mainWindow!, {
+      title: 'Choose an app to open (e.g. anki.exe)',
+      properties: ['openFile'],
+      filters: [
+        { name: 'Applications', extensions: ['exe', 'lnk', 'bat', 'cmd'] },
+        { name: 'All files', extensions: ['*'] }
+      ]
     })
     if (result.canceled || !result.filePaths[0]) return null
     return result.filePaths[0]

@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { ResourceType } from '../shared/types'
+import type { LocationKind, ResourceType } from '../shared/types'
 
 const api = {
   getPaths: () => ipcRenderer.invoke('app:getPaths'),
@@ -23,6 +23,16 @@ const api = {
   upsertPracticeExam: (input: unknown) => ipcRenderer.invoke('exams:upsert', input),
   deletePracticeExam: (id: string) => ipcRenderer.invoke('exams:delete', id),
 
+  listMissedQuestions: (examId: string) => ipcRenderer.invoke('missed:list', examId),
+  listMissedQuestionsInRotation: (projectId: string) =>
+    ipcRenderer.invoke('missed:listRotation', projectId),
+  upsertMissedQuestion: (input: unknown) => ipcRenderer.invoke('missed:upsert', input),
+  setMissedQuestionConfidence: (id: string, confidence: number) =>
+    ipcRenderer.invoke('missed:setConfidence', id, confidence),
+  setMissedQuestionInRotation: (id: string, inRotation: boolean) =>
+    ipcRenderer.invoke('missed:setRotation', id, inRotation),
+  deleteMissedQuestion: (id: string) => ipcRenderer.invoke('missed:delete', id),
+
   listResources: (
     projectId: string,
     opts?: {
@@ -41,8 +51,9 @@ const api = {
     historySummary?: string,
     historyExtras?: import('../shared/types').HistoryExtras
   ) => ipcRenderer.invoke('resources:update', id, patch, historySummary, historyExtras),
-  openResource: (kind: 'url' | 'file' | 'none', value: string) =>
+  openResource: (kind: LocationKind, value: string) =>
     ipcRenderer.invoke('resources:open', kind, value),
+  findAnkiExe: () => ipcRenderer.invoke('resources:findAnki') as Promise<string | null>,
 
   listSections: (resourceId: string, studyAreaId?: string | null) =>
     ipcRenderer.invoke('sections:list', resourceId, studyAreaId),
@@ -55,7 +66,10 @@ const api = {
 
   listQueue: (projectId: string) => ipcRenderer.invoke('queue:list', projectId),
   listTomorrowQueue: (projectId: string) => ipcRenderer.invoke('queue:listTomorrow', projectId),
+  listQueueForDate: (projectId: string, forDate: string) =>
+    ipcRenderer.invoke('queue:listForDate', projectId, forDate),
   addQueueItem: (input: unknown) => ipcRenderer.invoke('queue:add', input),
+  addQueueItemsForDates: (input: unknown) => ipcRenderer.invoke('queue:addDates', input),
   updateQueueItem: (id: string, patch: unknown) => ipcRenderer.invoke('queue:update', id, patch),
   completeQueueItem: (id: string) => ipcRenderer.invoke('queue:complete', id) as Promise<{
     progressRecorded: boolean
@@ -69,9 +83,29 @@ const api = {
   loadSample: (projectId: string) => ipcRenderer.invoke('sample:load', projectId),
   removeSample: (projectId: string) => ipcRenderer.invoke('sample:remove', projectId),
 
+  getCelebration: () =>
+    ipcRenderer.invoke('celebration:get') as Promise<{
+      imagePath: string
+      hasCustomImage: boolean
+      imageUrl: string | null
+    }>,
+  pickCelebrationImage: () =>
+    ipcRenderer.invoke('celebration:pick') as Promise<{
+      imagePath: string
+      hasCustomImage: boolean
+      imageUrl: string | null
+    }>,
+  clearCelebrationImage: () =>
+    ipcRenderer.invoke('celebration:clear') as Promise<{
+      imagePath: string
+      hasCustomImage: boolean
+      imageUrl: string | null
+    }>,
+
   exportBackup: () => ipcRenderer.invoke('backup:export'),
   restoreBackup: () => ipcRenderer.invoke('backup:restore'),
-  pickFile: () => ipcRenderer.invoke('dialog:pickFile')
+  pickFile: () => ipcRenderer.invoke('dialog:pickFile'),
+  pickApp: () => ipcRenderer.invoke('dialog:pickApp')
 }
 
 contextBridge.exposeInMainWorld('studyHub', api)

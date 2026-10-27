@@ -25,6 +25,10 @@ export default function AddResourceDialog({
   const changeType = (t: ResourceType) => {
     setType(t)
     setConfig(defaultConfigForType(t))
+    if (t === 'anki' && locationKind === 'none') {
+      setLocationKind('app')
+      setLocationValue('')
+    }
   }
 
   const toggleArea = (id: string) => {
@@ -124,6 +128,7 @@ export default function AddResourceDialog({
               <option value="none">No link yet</option>
               <option value="url">Website link</option>
               <option value="file">Local file</option>
+              <option value="app">Desktop app (e.g. Anki)</option>
             </select>
           </label>
           {locationKind === 'url' && (
@@ -153,6 +158,39 @@ export default function AddResourceDialog({
                 Choose file
               </button>
               <span className="meta">{locationValue || 'No file chosen'}</span>
+            </div>
+          )}
+          {locationKind === 'app' && (
+            <div>
+              <p className="helper-text">
+                Opens the app on this PC. For Anki: browse to <code>anki.exe</code> or use Find Anki. Study Hub does
+                not sync Anki data.
+              </p>
+              <div className="btn-row">
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={async () => {
+                    const path = await window.studyHub.pickApp()
+                    if (path) setLocationValue(path)
+                  }}
+                >
+                  Browse to app
+                </button>
+                {type === 'anki' && (
+                  <button
+                    type="button"
+                    className="btn btn-ghost"
+                    onClick={async () => {
+                      const found = await window.studyHub.findAnkiExe()
+                      if (found) setLocationValue(found)
+                    }}
+                  >
+                    Find Anki
+                  </button>
+                )}
+              </div>
+              <p className="meta">{locationValue || 'No app chosen yet'}</p>
             </div>
           )}
           <label>
@@ -215,7 +253,18 @@ function TypeDefaultsEditor({
           Track pages
         </label>
         <label>
-          Total pages (optional)
+          Expected total chapters (optional — Overview bar; mark chapters done on Chapters tab)
+          <input
+            type="number"
+            min={1}
+            value={c.totalChapters ?? ''}
+            onChange={(e) =>
+              onChange({ ...c, totalChapters: e.target.value ? Number(e.target.value) : null })
+            }
+          />
+        </label>
+        <label>
+          Total pages (optional — page-based bar if you prefer pages)
           <input
             type="number"
             min={1}
@@ -264,14 +313,37 @@ function TypeDefaultsEditor({
             <option value="milestones">Milestones</option>
           </select>
         </label>
+        {(c.mode === 'checklist' || c.mode === 'milestones') && (
+          <p className="helper-text">
+            After creating, define each {c.mode === 'checklist' ? 'checklist item' : 'milestone'} on the{' '}
+            {c.mode === 'checklist' ? 'Checklist' : 'Milestones'} tab. Progress checks them off; the Overview bar
+            uses that list.
+          </p>
+        )}
         {c.mode === 'units' && (
-          <label>
-            Unit label
-            <input
-              value={c.unitLabel ?? 'modules'}
-              onChange={(e) => onChange({ ...c, unitLabel: e.target.value })}
-            />
-          </label>
+          <>
+            <label>
+              Unit label
+              <input
+                value={c.unitLabel ?? 'modules'}
+                onChange={(e) => onChange({ ...c, unitLabel: e.target.value })}
+              />
+            </label>
+            <label>
+              Total units (for the progress bar)
+              <input
+                type="number"
+                min={1}
+                value={c.totalUnits ?? ''}
+                onChange={(e) =>
+                  onChange({ ...c, totalUnits: e.target.value ? Number(e.target.value) : null })
+                }
+              />
+            </label>
+            <p className="helper-text">
+              Progress sessions will add completed units toward this total (done ÷ total).
+            </p>
+          </>
         )}
       </div>
     )
