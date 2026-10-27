@@ -5,7 +5,7 @@ Public repo: **https://github.com/Yurinodac/study-hub**
 Users download builds from **Releases**:  
 https://github.com/Yurinodac/study-hub/releases
 
-Current app version in `package.json`: **1.1.10**
+Current app version in `package.json`: **1.1.14**
 
 ## Before you start (Windows)
 
@@ -26,7 +26,7 @@ gh auth login
 ```powershell
 git init
 git add .
-git commit -m "Study Hub 1.1.10"
+git commit -m "Study Hub 1.1.14"
 gh repo create Yurinodac/study-hub --public --source=. --remote=origin --push
 ```
 
@@ -35,13 +35,13 @@ If the empty repo already exists on GitHub:
 ```powershell
 git init
 git add .
-git commit -m "Study Hub 1.1.10"
+git commit -m "Study Hub 1.1.14"
 git branch -M main
 git remote add origin https://github.com/Yurinodac/study-hub.git
 git push -u origin main
 ```
 
-## Build Windows installer (v1.1.10)
+## Build Windows installer (v1.1.14)
 
 ```powershell
 cd path\to\study-hub
@@ -49,7 +49,7 @@ npm install
 npm run dist
 ```
 
-Typical output: `release\StudyHub-Setup-1.1.10.exe`
+Typical output: `release\StudyHub-Setup-1.1.14.exe`
 
 If NSIS download fails:
 
@@ -58,16 +58,16 @@ npm run dist:dir
 Compress-Archive -Path ".\release\win-unpacked\*" -DestinationPath ".\release\StudyHub-portable.zip"
 ```
 
-## Publish GitHub Release v1.1.10
+## Publish GitHub Release v1.1.14
 
 ```powershell
-gh release create v1.1.10 "release\StudyHub-Setup-1.1.10.exe" --title "Study Hub 1.1.10" --notes "Completion progress bars, multi-day calendar queue, practice-exam missed questions + flashcards, Open Anki app, and completion celebration picture. Download the Setup exe, install, and open Study Hub from the Start Menu."
+gh release create v1.1.14 "release\StudyHub-Setup-1.1.14.exe" --title "Study Hub 1.1.14" --notes "Completion progress bars, multi-day calendar queue, practice-exam missed questions + flashcards, Open Anki app, and completion celebration picture. Download the Setup exe, install, and open Study Hub from the Start Menu."
 ```
 
 Or for the portable zip:
 
 ```powershell
-gh release create v1.1.10 "release\StudyHub-portable.zip" --title "Study Hub 1.1.10" --notes "Portable Windows build. Unzip and run Study Hub.exe."
+gh release create v1.1.14 "release\StudyHub-portable.zip" --title "Study Hub 1.1.14" --notes "Portable Windows build. Unzip and run Study Hub.exe."
 ```
 
 ## Install (what to tell users)
@@ -89,7 +89,7 @@ git add .
 git commit -m "Describe your changes"
 git push
 npm run dist
-gh release create v1.1.10 "release\StudyHub-Setup-1.1.10.exe" --title "Study Hub 1.1.10" --notes "What changed"
+gh release create v1.1.14 "release\StudyHub-Setup-1.1.14.exe" --title "Study Hub 1.1.14" --notes "What changed"
 ```
 
 Bump `version` in `package.json` when you want the Setup filename version to change.

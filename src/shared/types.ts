@@ -183,7 +183,13 @@ export interface QueueItem {
   estimatedMinutes: number | null
   sortOrder: number
   completed: boolean
+  /** Scheduled / planned calendar day (YYYY-MM-DD). */
   forDate: string
+  /**
+   * When the item was marked complete (ISO timestamp).
+   * Calendar green dots use the local calendar day of this value — not forDate.
+   */
+  completedAt: string | null
   createdAt: string
 }
 
@@ -208,10 +214,13 @@ export interface PracticeExam {
   updatedAt: string
 }
 
-/** Missed question logged under a practice exam section (flashcard review). */
+/** Missed question logged under a practice exam or a question-bank / Anki resource. */
 export interface MissedQuestion {
   id: string
-  examId: string
+  /** Set when logged under a practice exam (null for resource-linked cards). */
+  examId: string | null
+  /** Set when logged on a question_bank / Anki resource (null for exam-linked cards). */
+  resourceId: string | null
   sectionCode: ExamSectionCode
   prompt: string
   correctAnswer: string
@@ -261,7 +270,7 @@ export interface CelebrationSettings {
   hasCustomImage: boolean
 }
 
-export const SCHEMA_VERSION = 5
+export const SCHEMA_VERSION = 7
 
 export const RESOURCE_TYPE_LABELS: Record<ResourceType, string> = {
   textbook: 'Textbook / reading',

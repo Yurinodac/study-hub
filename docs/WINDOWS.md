@@ -72,7 +72,7 @@ Then launch with `& ".\release\win-unpacked\Study Hub.exe"` (PowerShell) or doub
 
 Output (typical):
 
-- `release\StudyHub-Setup-1.1.10.exe` — NSIS installer (desktop shortcut: **Study Hub**)
+- `release\StudyHub-Setup-1.1.14.exe` — NSIS installer (desktop shortcut: **Study Hub**)
 - Intermediate unpackaged files may also appear under `release\win-unpacked\`
 
 Portable/dir-only build (no installer wizard):
@@ -122,7 +122,7 @@ Do **not** treat the unpacked Linux-built `.exe` as a finished, tested installer
 
 1. Copy `/agent/study-hub` to a Windows PC.
 2. `npm install`
-3. `npm run dist` → `release\StudyHub-Setup-1.1.10.exe`
+3. `npm run dist` → `release\StudyHub-Setup-1.1.14.exe`
 4. Install and walk through the manual test checklist.
 
 ## Troubleshooting
@@ -131,7 +131,7 @@ Do **not** treat the unpacked Linux-built `.exe` as a finished, tested installer
 |---------|-------------|
 | `'electron-builder' is not recognized as an internal or external command` | You almost certainly skipped or failed `npm install`. From the folder that contains `package.json`, run `npm install` and wait for it to finish. If it still fails, delete `node_modules` and `package-lock.json`, then run `npm install` again. **`npm install` must succeed before `npm run dev`.** |
 | `ERROR: Cannot create symbolic link : A required privilege is not held by the client` (often under `electron-builder\Cache\winCodeSign` / `libcrypto.dylib`) | **Cause:** electron-builder’s winCodeSign cache tries to create macOS symlinks; Windows blocks that without Developer Mode / admin. Unsigned local builds do not need code signing. **Fix:** Delete the folder `%LOCALAPPDATA%\electron-builder\Cache\winCodeSign`, then run `npm run dist` again with the updated project (`build.win.signAndEditExecutable` is `false`). **Optional:** enable Windows Developer Mode, or use `npm run dist:dir` for an unpacked folder instead of an NSIS installer. **Soft note:** if you still see odd file locks, prefer a non-OneDrive path (e.g. `C:\dev\study-hub`) instead of a Desktop folder synced by OneDrive. |
-| `lookup github.com: no such host` / `ERR_ELECTRON_BUILDER_CANNOT_EXECUTE` while fetching `electron-builder-binaries` / `nsis-...` | **Cause:** the PC cannot resolve or reach `github.com`. electron-builder downloads NSIS from GitHub to build the Setup.exe installer. **Immediate workaround:** run `npm run dist:dir`, then start the app with `release\win-unpacked\Study Hub.exe` (no NSIS download). **Fix network:** confirm a browser can open https://github.com; try another DNS (e.g. 1.1.10.1 or 8.8.8.8), briefly disable VPN, then retry `npm run dist`. **Soft note:** OneDrive paths can cause other packaging issues — prefer `C:\dev\study-hub` if problems continue. |
+| `lookup github.com: no such host` / `ERR_ELECTRON_BUILDER_CANNOT_EXECUTE` while fetching `electron-builder-binaries` / `nsis-...` | **Cause:** the PC cannot resolve or reach `github.com`. electron-builder downloads NSIS from GitHub to build the Setup.exe installer. **Immediate workaround:** run `npm run dist:dir`, then start the app with `release\win-unpacked\Study Hub.exe` (no NSIS download). **Fix network:** confirm a browser can open https://github.com; try another DNS (e.g. 1.1.14.1 or 8.8.8.8), briefly disable VPN, then retry `npm run dist`. **Soft note:** OneDrive paths can cause other packaging issues — prefer `C:\dev\study-hub` if problems continue. |
 | PowerShell “runs” `Study Hub.exe` but nothing happens / it only prints the path | In PowerShell, a quoted path by itself does **not** launch the app. From the project folder run: `& ".\release\win-unpacked\Study Hub.exe"` — or double-click `Study Hub.exe` in File Explorer under `release\win-unpacked\`. |
 | `Study Hub.exe` exists (~190MB) but “does not open” (silent) | 1) Confirm `npm run dist:dir` finished without errors. 2) Launch so you can see errors — **PowerShell:** `cd` to the project folder, then `& ".\release\win-unpacked\Study Hub.exe"`; **Command Prompt:** `cd /d path\to\study-hub` then `"release\win-unpacked\Study Hub.exe"`. 3) If a dialog appears, read it; also check `%APPDATA%\StudyHub\startup-error.log`. 4) Capture a console log: `& ".\release\win-unpacked\Study Hub.exe" 2>&1 | Tee-Object -FilePath startup-console.log` then open `startup-console.log`. 5) Allow the app through Windows Defender / SmartScreen if prompted. 6) Prefer a non-OneDrive path such as `C:\dev\study-hub`. 7) Force-clean natives (see NODE_MODULE_VERSION row) then `npm run dist:dir`. |
 | `NODE_MODULE_VERSION 127` / `was compiled against a different Node.js version` … `requires NODE_MODULE_VERSION 132` (often `better_sqlite3.node` under `app.asar.unpacked`) | **Cause:** `better-sqlite3` was built for plain Node.js (ABI **127**) instead of Electron **34** (ABI **132**). **Force-clean fix (project folder, PowerShell or cmd):** delete `node_modules\better-sqlite3\build`, run `npx electron-rebuild -f -w better-sqlite3`, run `npm run verify:native` (must print OK / ABI 132), delete `release\win-unpacked`, then `npm run dist:dir`. Launch with `& ".\release\win-unpacked\Study Hub.exe"`. If rebuild keeps failing on a OneDrive Desktop path, move the project to `C:\dev\study-hub` and repeat. |

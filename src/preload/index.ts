@@ -24,6 +24,8 @@ const api = {
   deletePracticeExam: (id: string) => ipcRenderer.invoke('exams:delete', id),
 
   listMissedQuestions: (examId: string) => ipcRenderer.invoke('missed:list', examId),
+  listMissedQuestionsForResource: (resourceId: string) =>
+    ipcRenderer.invoke('missed:listForResource', resourceId),
   listMissedQuestionsInRotation: (projectId: string) =>
     ipcRenderer.invoke('missed:listRotation', projectId),
   upsertMissedQuestion: (input: unknown) => ipcRenderer.invoke('missed:upsert', input),
@@ -32,6 +34,11 @@ const api = {
   setMissedQuestionInRotation: (id: string, inRotation: boolean) =>
     ipcRenderer.invoke('missed:setRotation', id, inRotation),
   deleteMissedQuestion: (id: string) => ipcRenderer.invoke('missed:delete', id),
+
+  getProjectTestDate: (projectId: string) =>
+    ipcRenderer.invoke('testDate:get', projectId) as Promise<string | null>,
+  setProjectTestDate: (projectId: string, ymd: string | null) =>
+    ipcRenderer.invoke('testDate:set', projectId, ymd) as Promise<string | null>,
 
   listResources: (
     projectId: string,
@@ -66,8 +73,10 @@ const api = {
 
   listQueue: (projectId: string) => ipcRenderer.invoke('queue:list', projectId),
   listTomorrowQueue: (projectId: string) => ipcRenderer.invoke('queue:listTomorrow', projectId),
-  listQueueForDate: (projectId: string, forDate: string) =>
-    ipcRenderer.invoke('queue:listForDate', projectId, forDate),
+  listQueueForDate: (projectId: string, forDate: string, includeCompleted?: boolean) =>
+    ipcRenderer.invoke('queue:listForDate', projectId, forDate, includeCompleted),
+  listQueueInRange: (projectId: string, startYmd: string, endYmd: string) =>
+    ipcRenderer.invoke('queue:listInRange', projectId, startYmd, endYmd),
   addQueueItem: (input: unknown) => ipcRenderer.invoke('queue:add', input),
   addQueueItemsForDates: (input: unknown) => ipcRenderer.invoke('queue:addDates', input),
   updateQueueItem: (id: string, patch: unknown) => ipcRenderer.invoke('queue:update', id, patch),

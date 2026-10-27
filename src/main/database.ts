@@ -27,7 +27,7 @@ import {
   progressFromQueueCompletion,
   summarizeProgress
 } from '../shared/progress'
-import { eachDateInclusive } from '../shared/dates'
+import { eachDateInclusive, localYmdFromTimestamp } from '../shared/dates'
 import {
   MCAT_CATEGORY_NAMES,
   clampPracticeScore,
@@ -230,13 +230,73 @@ function migrate(database: SqlDb): void {
       `)
       database.prepare('UPDATE meta SET value = ? WHERE key = ?').run('5', 'schemaVersion')
     }
+    if (current < 6) {
+      migrateMissedQuestionsToV6(database)
+      database.prepare('UPDATE meta SET value = ? WHERE key = ?').run('6', 'schemaVersion')
+    }
+    if (current < 7) {
+      ensureColumn(database, 'queue_items', 'completed_at', 'TEXT')
+      // Best-effort backfill for older completed rows (no real completion stamp existed).
+      database.exec(`
+        UPDATE queue_items
+        SET completed_at = for_date
+        WHERE completed = 1 AND (completed_at IS NULL OR completed_at = '')
+          AND for_date IS NOT NULL
+      `)
+      database.prepare('UPDATE meta SET value = ? WHERE key = ?').run('7', 'schemaVersion')
+    }
   }
 
-  // Idempotent: ensure missed-questions table exists even if schema bump was skipped.
+  // Idempotent: ensure missed-questions table exists (v6 shape: exam_id and/or resource_id).
+  ensureMissedQuestionsTable(database)
+  ensureColumn(database, 'queue_items', 'completed_at', 'TEXT')
+}
+
+function ensureMissedQuestionsTable(database: SqlDb): void {
+  const exists = database
+    .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='practice_missed_questions'`)
+    .get() as { name?: string } | undefined
+  if (!exists) {
+    database.exec(`
+      CREATE TABLE practice_missed_questions (
+        id TEXT PRIMARY KEY,
+        exam_id TEXT REFERENCES practice_exams(id) ON DELETE CASCADE,
+        resource_id TEXT REFERENCES resources(id) ON DELETE CASCADE,
+        section_code TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        correct_answer TEXT NOT NULL DEFAULT '',
+        commentary TEXT NOT NULL DEFAULT '',
+        confidence INTEGER NOT NULL DEFAULT 1,
+        in_rotation INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `)
+    return
+  }
+  ensureColumn(database, 'practice_missed_questions', 'resource_id', 'TEXT')
+}
+
+function migrateMissedQuestionsToV6(database: SqlDb): void {
+  const exists = database
+    .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='practice_missed_questions'`)
+    .get() as { name?: string } | undefined
+  if (!exists) {
+    ensureMissedQuestionsTable(database)
+    return
+  }
+  const cols = database.prepare(`PRAGMA table_info(practice_missed_questions)`).all() as Array<{
+    name: string
+  }>
+  if (cols.some((c) => c.name === 'resource_id')) {
+    // Already has resource_id — leave rows as-is (exam_id may still be NOT NULL from v5).
+    return
+  }
   database.exec(`
-    CREATE TABLE IF NOT EXISTS practice_missed_questions (
+    CREATE TABLE practice_missed_questions_v6 (
       id TEXT PRIMARY KEY,
-      exam_id TEXT NOT NULL REFERENCES practice_exams(id) ON DELETE CASCADE,
+      exam_id TEXT REFERENCES practice_exams(id) ON DELETE CASCADE,
+      resource_id TEXT REFERENCES resources(id) ON DELETE CASCADE,
       section_code TEXT NOT NULL,
       prompt TEXT NOT NULL,
       correct_answer TEXT NOT NULL DEFAULT '',
@@ -246,6 +306,16 @@ function migrate(database: SqlDb): void {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    INSERT INTO practice_missed_questions_v6 (
+      id, exam_id, resource_id, section_code, prompt, correct_answer, commentary,
+      confidence, in_rotation, created_at, updated_at
+    )
+    SELECT
+      id, exam_id, NULL, section_code, prompt, correct_answer, commentary,
+      confidence, in_rotation, created_at, updated_at
+    FROM practice_missed_questions;
+    DROP TABLE practice_missed_questions;
+    ALTER TABLE practice_missed_questions_v6 RENAME TO practice_missed_questions;
   `)
 }
 
@@ -927,6 +997,7 @@ function mapQueueRow(r: Record<string, unknown>): QueueItem {
     sortOrder: Number(r.sort_order),
     completed: Boolean(r.completed),
     forDate: r.for_date ? String(r.for_date) : localDateISO(0),
+    completedAt: r.completed_at ? String(r.completed_at) : null,
     createdAt: String(r.created_at)
   }
 }
@@ -954,16 +1025,74 @@ export function listTomorrowQueue(projectId: string): QueueItem[] {
   return listQueueForDate(projectId, localDateISO(1))
 }
 
-/** Active (incomplete) items for an exact calendar date. */
-export function listQueueForDate(projectId: string, forDate: string): QueueItem[] {
-  const rows = getDb()
+/**
+ * Queue items for a calendar day.
+ * - Open items: scheduled for that day (for_date).
+ * - When includeCompleted: also completed items whose completion day (local YMD of completed_at) is that day.
+ */
+export function listQueueForDate(
+  projectId: string,
+  forDate: string,
+  includeCompleted = false
+): QueueItem[] {
+  if (!includeCompleted) {
+    const rows = getDb()
+      .prepare(
+        `SELECT * FROM queue_items
+         WHERE project_id = ? AND completed = 0 AND for_date = ?
+         ORDER BY sort_order ASC`
+      )
+      .all(projectId, forDate) as Array<Record<string, unknown>>
+    return rows.map(mapQueueRow)
+  }
+  // Pull a wider set and filter completion day in JS (completed_at is ISO; local YMD varies by TZ).
+  const open = getDb()
     .prepare(
       `SELECT * FROM queue_items
        WHERE project_id = ? AND completed = 0 AND for_date = ?
        ORDER BY sort_order ASC`
     )
     .all(projectId, forDate) as Array<Record<string, unknown>>
-  return rows.map(mapQueueRow)
+  const doneCandidates = getDb()
+    .prepare(
+      `SELECT * FROM queue_items
+       WHERE project_id = ? AND completed = 1 AND completed_at IS NOT NULL
+       ORDER BY sort_order ASC`
+    )
+    .all(projectId) as Array<Record<string, unknown>>
+  const done = doneCandidates.filter((r) => localYmdFromTimestamp(String(r.completed_at)) === forDate)
+  return [...open, ...done].map(mapQueueRow)
+}
+
+/**
+ * Queue items relevant to a calendar range for markers:
+ * - planned (yellow): incomplete, for_date in range
+ * - done (green): completed, local completion day in range
+ */
+export function listQueueInRange(projectId: string, startYmd: string, endYmd: string): QueueItem[] {
+  const planned = getDb()
+    .prepare(
+      `SELECT * FROM queue_items
+       WHERE project_id = ? AND completed = 0
+         AND for_date IS NOT NULL AND for_date >= ? AND for_date <= ?
+       ORDER BY for_date ASC, sort_order ASC`
+    )
+    .all(projectId, startYmd, endYmd) as Array<Record<string, unknown>>
+  // Completed rows: load those that might fall in range (ISO dates sort near YMD; pad a day for TZ).
+  const doneCandidates = getDb()
+    .prepare(
+      `SELECT * FROM queue_items
+       WHERE project_id = ? AND completed = 1 AND completed_at IS NOT NULL
+         AND substr(completed_at, 1, 10) >= date(?, '-1 day')
+         AND substr(completed_at, 1, 10) <= date(?, '+1 day')
+       ORDER BY completed_at ASC, sort_order ASC`
+    )
+    .all(projectId, startYmd, endYmd) as Array<Record<string, unknown>>
+  const done = doneCandidates.filter((r) => {
+    const ymd = localYmdFromTimestamp(String(r.completed_at))
+    return ymd != null && ymd >= startYmd && ymd <= endYmd
+  })
+  return [...planned, ...done].map(mapQueueRow)
 }
 
 export function addQueueItem(input: {
@@ -1011,12 +1140,13 @@ function insertQueueItemForDate(input: {
     sortOrder: max.m + 1,
     completed: false,
     forDate: input.forDate,
+    completedAt: null,
     createdAt: nowIso()
   }
   getDb()
     .prepare(
-      `INSERT INTO queue_items (id, project_id, resource_id, description, estimated_minutes, sort_order, completed, created_at, for_date)
-       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`
+      `INSERT INTO queue_items (id, project_id, resource_id, description, estimated_minutes, sort_order, completed, created_at, for_date, completed_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, NULL)`
     )
     .run(
       item.id,
@@ -1041,10 +1171,15 @@ export function addQueueItemsForDates(input: {
   estimatedMinutes?: number | null
   startDate: string
   endDate?: string
+  /** Prefer this when scheduling multi-select or recurrence expansions. */
+  dates?: string[]
 }): QueueItem[] {
-  const dates = eachDateInclusive(input.startDate, input.endDate ?? input.startDate)
+  const dates =
+    input.dates?.length
+      ? Array.from(new Set(input.dates.map((d) => d.trim()).filter(Boolean))).sort()
+      : eachDateInclusive(input.startDate, input.endDate ?? input.startDate)
   if (!dates.length) {
-    throw new Error('Pick a valid start (and optional end) date.')
+    throw new Error('Pick at least one valid date.')
   }
   const created: QueueItem[] = []
   const tx = getDb().transaction(() => {
@@ -1070,18 +1205,34 @@ export function updateQueueItem(
     description: string
     estimatedMinutes: number | null
     completed: boolean
+    completedAt: string | null
     sortOrder: number
     resourceId: string | null
   }>
 ): void {
   const row = getDb().prepare('SELECT * FROM queue_items WHERE id = ?').get(id) as Record<string, unknown> | undefined
   if (!row) throw new Error('Queue item not found')
+  const nextCompleted =
+    patch.completed !== undefined ? (patch.completed ? 1 : 0) : row.completed
+  let nextCompletedAt: string | null =
+    patch.completedAt !== undefined
+      ? patch.completedAt
+      : row.completed_at
+        ? String(row.completed_at)
+        : null
+  if (patch.completed === true && !nextCompletedAt) {
+    nextCompletedAt = nowIso()
+  }
+  if (patch.completed === false) {
+    nextCompletedAt = null
+  }
   getDb()
     .prepare(
       `UPDATE queue_items SET
         description = ?,
         estimated_minutes = ?,
         completed = ?,
+        completed_at = ?,
         sort_order = ?,
         resource_id = ?
       WHERE id = ?`
@@ -1089,7 +1240,8 @@ export function updateQueueItem(
     .run(
       patch.description !== undefined ? patch.description : row.description,
       patch.estimatedMinutes !== undefined ? patch.estimatedMinutes : row.estimated_minutes,
-      patch.completed !== undefined ? (patch.completed ? 1 : 0) : row.completed,
+      nextCompleted,
+      nextCompletedAt,
       patch.sortOrder !== undefined ? patch.sortOrder : row.sort_order,
       patch.resourceId !== undefined ? patch.resourceId : row.resource_id,
       id
@@ -1109,7 +1261,7 @@ export function completeQueueItem(id: string): {
     | undefined
   if (!row) throw new Error('Queue item not found')
 
-  updateQueueItem(id, { completed: true })
+  updateQueueItem(id, { completed: true, completedAt: nowIso() })
 
   const resourceId = row.resource_id ? String(row.resource_id) : null
   if (!resourceId) {
@@ -1290,7 +1442,8 @@ export function deletePracticeExam(id: string): void {
 function mapMissedQuestion(r: Record<string, unknown>): MissedQuestion {
   return {
     id: String(r.id),
-    examId: String(r.exam_id),
+    examId: r.exam_id ? String(r.exam_id) : null,
+    resourceId: r.resource_id ? String(r.resource_id) : null,
     sectionCode: String(r.section_code) as ExamSectionCode,
     prompt: String(r.prompt ?? ''),
     correctAnswer: String(r.correct_answer ?? ''),
@@ -1312,21 +1465,37 @@ export function listMissedQuestions(examId: string): MissedQuestion[] {
   return rows.map(mapMissedQuestion)
 }
 
+export function listMissedQuestionsForResource(resourceId: string): MissedQuestion[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT * FROM practice_missed_questions WHERE resource_id = ?
+       ORDER BY section_code ASC, created_at ASC`
+    )
+    .all(resourceId) as Array<Record<string, unknown>>
+  return rows.map(mapMissedQuestion)
+}
+
 export function listMissedQuestionsInRotation(projectId: string): MissedQuestion[] {
   const rows = getDb()
     .prepare(
       `SELECT mq.* FROM practice_missed_questions mq
-       JOIN practice_exams e ON e.id = mq.exam_id
-       WHERE e.project_id = ? AND mq.in_rotation = 1
+       LEFT JOIN practice_exams e ON e.id = mq.exam_id
+       LEFT JOIN resources r ON r.id = mq.resource_id
+       WHERE mq.in_rotation = 1
+         AND (
+           (e.project_id IS NOT NULL AND e.project_id = ?)
+           OR (r.project_id IS NOT NULL AND r.project_id = ?)
+         )
        ORDER BY mq.confidence ASC, mq.updated_at ASC`
     )
-    .all(projectId) as Array<Record<string, unknown>>
+    .all(projectId, projectId) as Array<Record<string, unknown>>
   return rows.map(mapMissedQuestion)
 }
 
 export function upsertMissedQuestion(input: {
   id?: string
-  examId: string
+  examId?: string | null
+  resourceId?: string | null
   sectionCode: ExamSectionCode
   prompt: string
   correctAnswer?: string
@@ -1336,6 +1505,11 @@ export function upsertMissedQuestion(input: {
 }): MissedQuestion {
   const stamp = nowIso()
   const confidence = Math.min(5, Math.max(1, Math.round(input.confidence ?? 1)))
+  const examId = input.examId?.trim() || null
+  const resourceId = input.resourceId?.trim() || null
+  if (!input.id && !examId && !resourceId) {
+    throw new Error('Missed questions need a practice exam or a question resource.')
+  }
   if (input.id) {
     getDb()
       .prepare(
@@ -1361,7 +1535,8 @@ export function upsertMissedQuestion(input: {
   }
   const q: MissedQuestion = {
     id: randomUUID(),
-    examId: input.examId,
+    examId,
+    resourceId,
     sectionCode: input.sectionCode,
     prompt: input.prompt.trim(),
     correctAnswer: (input.correctAnswer ?? '').trim(),
@@ -1374,13 +1549,14 @@ export function upsertMissedQuestion(input: {
   getDb()
     .prepare(
       `INSERT INTO practice_missed_questions (
-        id, exam_id, section_code, prompt, correct_answer, commentary,
+        id, exam_id, resource_id, section_code, prompt, correct_answer, commentary,
         confidence, in_rotation, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       q.id,
       q.examId,
+      q.resourceId,
       q.sectionCode,
       q.prompt,
       q.correctAnswer,
@@ -1391,6 +1567,27 @@ export function upsertMissedQuestion(input: {
       q.updatedAt
     )
   return q
+}
+
+const TEST_DATE_META_PREFIX = 'testDate:'
+
+export function getProjectTestDate(projectId: string): string | null {
+  const v = getMeta(`${TEST_DATE_META_PREFIX}${projectId}`)
+  return v && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null
+}
+
+export function setProjectTestDate(projectId: string, ymd: string | null): string | null {
+  const key = `${TEST_DATE_META_PREFIX}${projectId}`
+  if (!ymd || !ymd.trim()) {
+    getDb().prepare('DELETE FROM meta WHERE key = ?').run(key)
+    return null
+  }
+  const trimmed = ymd.trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    throw new Error('Test date must look like YYYY-MM-DD.')
+  }
+  setMeta(key, trimmed)
+  return trimmed
 }
 
 export function updateMissedQuestionConfidence(id: string, confidence: number): MissedQuestion {
@@ -1463,6 +1660,9 @@ export function exportBackup(): BackupPayload {
       resources.push(resource)
       sections.push(...listSections(resource.id))
       history.push(...listHistory(resource.id))
+      if (resource.type === 'question_bank' || resource.type === 'anki') {
+        missedQuestions.push(...listMissedQuestionsForResource(resource.id))
+      }
     }
     queue.push(...listQueue(p.id, true))
   }
@@ -1602,8 +1802,8 @@ export function restoreBackup(payload: BackupPayload, recoveryDir: string): stri
     }
 
     const insertQueue = database.prepare(
-      `INSERT INTO queue_items (id, project_id, resource_id, description, estimated_minutes, sort_order, completed, created_at, for_date)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO queue_items (id, project_id, resource_id, description, estimated_minutes, sort_order, completed, created_at, for_date, completed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     for (const q of payload.queue ?? []) {
       insertQueue.run(
@@ -1615,7 +1815,8 @@ export function restoreBackup(payload: BackupPayload, recoveryDir: string): stri
         q.sortOrder,
         q.completed ? 1 : 0,
         q.createdAt,
-        q.forDate || localDateISO(0)
+        q.forDate || localDateISO(0),
+        q.completedAt ?? (q.completed ? q.forDate || null : null)
       )
     }
 
@@ -1645,14 +1846,15 @@ export function restoreBackup(payload: BackupPayload, recoveryDir: string): stri
 
     const insertMissed = database.prepare(
       `INSERT INTO practice_missed_questions (
-        id, exam_id, section_code, prompt, correct_answer, commentary,
+        id, exam_id, resource_id, section_code, prompt, correct_answer, commentary,
         confidence, in_rotation, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     for (const q of payload.missedQuestions ?? []) {
       insertMissed.run(
         q.id,
-        q.examId,
+        q.examId ?? null,
+        q.resourceId ?? null,
         q.sectionCode,
         q.prompt,
         q.correctAnswer ?? '',

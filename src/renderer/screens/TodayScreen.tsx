@@ -2,11 +2,17 @@ import { useEffect, useMemo, useState } from 'react'
 import type { ProjectHistoryEntry, QueueItem, Resource, ResourceCard } from '../../shared/types'
 import { continueStudyingLabel } from '../../shared/progress'
 import { formatYmd } from '../../shared/dates'
+import {
+  resolveScheduleDates,
+  scheduleStatusMessage,
+  type QueueScheduleValue
+} from '../../shared/schedule'
 import CelebrationModal from '../components/CelebrationModal'
 import CompletionBar from '../components/CompletionBar'
+import QueueScheduleFields from '../components/QueueScheduleFields'
+import TestCountdownStrip from '../components/TestCountdownStrip'
 
 type TodayTab = 'queue' | 'continue' | 'history'
-type ScheduleMode = 'today' | 'tomorrow' | 'date' | 'range'
 
 const TABS: Array<{ id: TodayTab; label: string }> = [
   { id: 'queue', label: 'Queue' },
@@ -53,9 +59,7 @@ export default function TodayScreen({
   const [newDesc, setNewDesc] = useState('')
   const [newMinutes, setNewMinutes] = useState('')
   const [newResourceId, setNewResourceId] = useState('')
-  const [scheduleMode, setScheduleMode] = useState<ScheduleMode>('today')
-  const [pickDate, setPickDate] = useState(() => todayYmd())
-  const [rangeEnd, setRangeEnd] = useState(() => tomorrowYmd())
+  const [schedule, setSchedule] = useState<QueueScheduleValue>({ mode: 'today' })
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editDesc, setEditDesc] = useState('')
   const [editMinutes, setEditMinutes] = useState('')
@@ -271,7 +275,12 @@ export default function TodayScreen({
             <p>Queue what to do next, continue recent work, or review your study history.</p>
           </div>
         </div>
-        <div className="tablist" role="tablist" aria-label="Today">
+        <TestCountdownStrip
+          projectId={projectId}
+          refreshKey={refreshKey}
+          showStatus={showStatus}
+        />
+        <div className="tablist" role="tablist" aria-label="Today" style={{ marginTop: '1rem' }}>
           {TABS.map((t) => (
             <button
               key={t.id}
@@ -322,29 +331,18 @@ export default function TodayScreen({
                 description: newDesc.trim(),
                 estimatedMinutes: newMinutes ? Number(newMinutes) : null
               }
-              if (scheduleMode === 'today') {
-                await window.studyHub.addQueueItem({ ...base, when: 'today' })
-                showStatus('Added to Today’s queue.')
-              } else if (scheduleMode === 'tomorrow') {
-                await window.studyHub.addQueueItem({ ...base, when: 'tomorrow' })
-                showStatus('Added to Tomorrow’s queue.')
-              } else if (scheduleMode === 'date') {
-                await window.studyHub.addQueueItemsForDates({ ...base, startDate: pickDate })
-                showStatus(`Added for ${pickDate}.`)
-                setCalendarDate(pickDate)
-              } else {
-                const items = await window.studyHub.addQueueItemsForDates({
-                  ...base,
-                  startDate: pickDate,
-                  endDate: rangeEnd
-                })
-                showStatus(`Added to ${items.length} day${items.length === 1 ? '' : 's'}.`)
-                setCalendarDate(pickDate)
+              const dates = resolveScheduleDates(schedule, todayYmd())
+              if (!dates.length) {
+                showStatus('Pick at least one date for this task.', 'warn')
+                return
               }
+              await window.studyHub.addQueueItemsForDates({ ...base, startDate: dates[0], dates })
+              showStatus(scheduleStatusMessage(dates, 'Added.'))
+              setCalendarDate(dates[0])
               setNewDesc('')
               setNewMinutes('')
               setNewResourceId('')
-              setScheduleMode('today')
+              setSchedule({ mode: 'today' })
               onChanged()
             }}
           >
@@ -386,31 +384,7 @@ export default function TodayScreen({
                 ))}
               </select>
             </label>
-            <label>
-              Schedule
-              <select
-                value={scheduleMode}
-                onChange={(e) => setScheduleMode(e.target.value as ScheduleMode)}
-                name="today-queue-when"
-              >
-                <option value="today">Today</option>
-                <option value="tomorrow">Tomorrow</option>
-                <option value="date">Pick a date</option>
-                <option value="range">Several days (date range)</option>
-              </select>
-            </label>
-            {(scheduleMode === 'date' || scheduleMode === 'range') && (
-              <label>
-                {scheduleMode === 'range' ? 'From date' : 'Date'}
-                <input type="date" value={pickDate} onChange={(e) => setPickDate(e.target.value)} required />
-              </label>
-            )}
-            {scheduleMode === 'range' && (
-              <label>
-                Through date
-                <input type="date" value={rangeEnd} onChange={(e) => setRangeEnd(e.target.value)} required />
-              </label>
-            )}
+            <QueueScheduleFields value={schedule} onChange={setSchedule} label="When" />
             <div className="btn-row">
               <button type="submit" className="btn btn-primary">
                 Add to queue

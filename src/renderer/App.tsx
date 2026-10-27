@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { Category, Project, Resource } from '../shared/types'
 import TodayScreen from './screens/TodayScreen'
+import CalendarScreen from './screens/CalendarScreen'
 import ResourcesScreen from './screens/ResourcesScreen'
 import ResourceDetailsScreen from './screens/ResourceDetailsScreen'
 import SettingsPanel from './components/SettingsPanel'
 import StatusBanner from './components/StatusBanner'
 
-type Screen = 'today' | 'resources' | 'details' | 'settings'
+type Screen = 'today' | 'calendar' | 'resources' | 'details' | 'settings'
 export type DetailsFocus = 'overview' | 'progress' | 'history'
 
 export default function App() {
@@ -139,6 +140,13 @@ export default function App() {
             </button>
             <button
               type="button"
+              aria-current={screen === 'calendar' ? 'page' : undefined}
+              onClick={() => setScreen('calendar')}
+            >
+              Calendar
+            </button>
+            <button
+              type="button"
               aria-current={screen === 'resources' || screen === 'details' ? 'page' : undefined}
               onClick={() => setScreen('resources')}
             >
@@ -163,6 +171,16 @@ export default function App() {
             onOpenResource={openLinkedResource}
             onUpdateProgress={(id) => openResourceDetails(id, 'progress')}
             onOpenDetails={(id) => openResourceDetails(id, 'overview')}
+            onChanged={bump}
+            showStatus={showStatus}
+          />
+        )}
+        {screen === 'calendar' && (
+          <CalendarScreen
+            projectId={projectId}
+            refreshKey={refreshKey}
+            onOpenResource={openLinkedResource}
+            onUpdateProgress={(id) => openResourceDetails(id, 'progress')}
             onChanged={bump}
             showStatus={showStatus}
           />

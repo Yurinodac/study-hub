@@ -204,6 +204,9 @@ function registerIpc(): void {
   })
 
   ipcMain.handle('missed:list', (_e, examId: string) => db.listMissedQuestions(examId))
+  ipcMain.handle('missed:listForResource', (_e, resourceId: string) =>
+    db.listMissedQuestionsForResource(resourceId)
+  )
   ipcMain.handle('missed:listRotation', (_e, projectId: string) =>
     db.listMissedQuestionsInRotation(projectId)
   )
@@ -217,6 +220,11 @@ function registerIpc(): void {
   ipcMain.handle('missed:delete', (_e, id: string) => {
     db.deleteMissedQuestion(id)
   })
+
+  ipcMain.handle('testDate:get', (_e, projectId: string) => db.getProjectTestDate(projectId))
+  ipcMain.handle('testDate:set', (_e, projectId: string, ymd: string | null) =>
+    db.setProjectTestDate(projectId, ymd)
+  )
 
   ipcMain.handle(
     'resources:list',
@@ -267,8 +275,15 @@ function registerIpc(): void {
 
   ipcMain.handle('queue:list', (_e, projectId: string) => db.listQueue(projectId))
   ipcMain.handle('queue:listTomorrow', (_e, projectId: string) => db.listTomorrowQueue(projectId))
-  ipcMain.handle('queue:listForDate', (_e, projectId: string, forDate: string) =>
-    db.listQueueForDate(projectId, forDate)
+  ipcMain.handle(
+    'queue:listForDate',
+    (_e, projectId: string, forDate: string, includeCompleted?: boolean) =>
+      db.listQueueForDate(projectId, forDate, includeCompleted)
+  )
+  ipcMain.handle(
+    'queue:listInRange',
+    (_e, projectId: string, startYmd: string, endYmd: string) =>
+      db.listQueueInRange(projectId, startYmd, endYmd)
   )
   ipcMain.handle('queue:add', (_e, input) => db.addQueueItem(input))
   ipcMain.handle('queue:addDates', (_e, input) => db.addQueueItemsForDates(input))

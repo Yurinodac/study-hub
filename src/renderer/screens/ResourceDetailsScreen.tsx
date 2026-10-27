@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import type {
   AnkiConfig,
   CustomConfig,
+  ExamSectionCode,
   LocationKind,
+  MissedQuestion,
   QuestionBankConfig,
   Resource,
   ResourceConfig,
@@ -12,7 +14,7 @@ import type {
   TextbookConfig,
   VideoConfig
 } from '../../shared/types'
-import { RESOURCE_TYPE_LABELS } from '../../shared/types'
+import { EXAM_SECTION_CODES, RESOURCE_TYPE_LABELS } from '../../shared/types'
 import {
   chapterCompletionFromSections,
   embeddedCustomItems,
@@ -30,16 +32,19 @@ import {
 import { shouldApplyServerSnapshot } from '../../shared/draft-sync'
 import type { DetailsFocus } from '../App'
 import CompletionBar from '../components/CompletionBar'
+import QueueScheduleFields from '../components/QueueScheduleFields'
 import { formatYmd } from '../../shared/dates'
+import {
+  resolveScheduleDates,
+  scheduleStatusMessage,
+  type QueueScheduleValue
+} from '../../shared/schedule'
 
-type NextActionSchedule =
-  | { mode: 'none' }
-  | { mode: 'today' }
-  | { mode: 'tomorrow' }
-  | { mode: 'date'; startDate: string }
-  | { mode: 'range'; startDate: string; endDate: string }
+type TabId = 'overview' | 'progress' | 'chapters' | 'missed' | 'history'
 
-type TabId = 'overview' | 'progress' | 'chapters' | 'history'
+function resourceHasMissedTab(resource: Pick<Resource, 'type'>): boolean {
+  return resource.type === 'question_bank' || resource.type === 'anki'
+}
 
 function tabsForResource(resource: Resource): Array<{ id: TabId; label: string }> {
   const tabs: Array<{ id: TabId; label: string }> = [
@@ -48,6 +53,9 @@ function tabsForResource(resource: Resource): Array<{ id: TabId; label: string }
   ]
   if (resourceHasItemsTab(resource)) {
     tabs.push({ id: 'chapters', label: itemsTabLabel(resource) })
+  }
+  if (resourceHasMissedTab(resource)) {
+    tabs.push({ id: 'missed', label: 'Missed Q' })
   }
   tabs.push({ id: 'history', label: 'History' })
   return tabs
@@ -788,30 +796,19 @@ export default function ResourceDetailsScreen({
                 showStatus('Progress saved.')
                 return
               }
-              const base = {
+              const dates = resolveScheduleDates(schedule, formatYmd(new Date()))
+              if (!dates.length) {
+                showStatus('Progress saved, but no queue dates were selected.', 'warn')
+                return
+              }
+              await window.studyHub.addQueueItemsForDates({
                 projectId: resource.projectId,
                 resourceId: resource.id,
-                description: action
-              }
-              if (schedule.mode === 'today') {
-                await window.studyHub.addQueueItem({ ...base, when: 'today' })
-                showStatus('Progress saved. Next action added to Today’s queue.')
-              } else if (schedule.mode === 'tomorrow') {
-                await window.studyHub.addQueueItem({ ...base, when: 'tomorrow' })
-                showStatus('Progress saved. Next action added to Tomorrow’s queue.')
-              } else if (schedule.mode === 'date') {
-                await window.studyHub.addQueueItemsForDates({ ...base, startDate: schedule.startDate })
-                showStatus(`Progress saved. Next action scheduled for ${schedule.startDate}.`)
-              } else {
-                const items = await window.studyHub.addQueueItemsForDates({
-                  ...base,
-                  startDate: schedule.startDate,
-                  endDate: schedule.endDate
-                })
-                showStatus(
-                  `Progress saved. Next action added to ${items.length} day${items.length === 1 ? '' : 's'}.`
-                )
-              }
+                description: action,
+                startDate: dates[0],
+                dates
+              })
+              showStatus(scheduleStatusMessage(dates, 'Progress saved.'))
             }}
           />
         </section>
@@ -826,6 +823,14 @@ export default function ResourceDetailsScreen({
           setSections={setSections}
           setResource={setResource}
           setTab={setTab}
+          showStatus={showStatus}
+          onChanged={onChanged}
+        />
+      )}
+
+      {tab === 'missed' && resourceHasMissedTab(resource) && (
+        <ResourceMissedPanel
+          resource={resource}
           showStatus={showStatus}
           onChanged={onChanged}
         />
@@ -900,6 +905,234 @@ export default function ResourceDetailsScreen({
         </section>
       )}
     </div>
+  )
+}
+
+function ResourceMissedPanel({
+  resource,
+  showStatus,
+  onChanged
+}: {
+  resource: Resource
+  showStatus: (message: string, tone?: 'ok' | 'warn') => void
+  onChanged: () => void
+}) {
+  const [missed, setMissed] = useState<MissedQuestion[]>([])
+  const [mqSection, setMqSection] = useState<ExamSectionCode>('C/P')
+  const [mqPrompt, setMqPrompt] = useState('')
+  const [mqAnswer, setMqAnswer] = useState('')
+  const [mqNotes, setMqNotes] = useState('')
+  const [flashIndex, setFlashIndex] = useState(0)
+  const [flashRevealed, setFlashRevealed] = useState(false)
+
+  const reload = async () => {
+    setMissed(await window.studyHub.listMissedQuestionsForResource(resource.id))
+  }
+
+  useEffect(() => {
+    void reload()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resource.id])
+
+  const inRotation = missed.filter((q) => q.inRotation)
+  const flashCard = inRotation[flashIndex] ?? null
+
+  return (
+    <section className="panel" role="tabpanel" id="panel-missed" aria-labelledby="tab-missed">
+      <div className="section-head">
+        <div>
+          <h2>Missed questions</h2>
+          <p>
+            Same flow as practice exams: log a missed question, review it like a flashcard, set confidence 1–5, or
+            take it out of rotation.
+          </p>
+        </div>
+      </div>
+
+      <form
+        className="form-grid"
+        onSubmit={async (e) => {
+          e.preventDefault()
+          if (!mqPrompt.trim()) return
+          await window.studyHub.upsertMissedQuestion({
+            resourceId: resource.id,
+            sectionCode: mqSection,
+            prompt: mqPrompt.trim(),
+            correctAnswer: mqAnswer.trim(),
+            commentary: mqNotes.trim(),
+            confidence: 2,
+            inRotation: true
+          })
+          setMqPrompt('')
+          setMqAnswer('')
+          setMqNotes('')
+          showStatus('Missed question saved.')
+          await reload()
+          onChanged()
+        }}
+      >
+        <label>
+          Exam section (optional label)
+          <select value={mqSection} onChange={(e) => setMqSection(e.target.value as ExamSectionCode)}>
+            {EXAM_SECTION_CODES.map((code) => (
+              <option key={code} value={code}>
+                {code}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Question text or ID
+          <input
+            value={mqPrompt}
+            onChange={(e) => setMqPrompt(e.target.value)}
+            required
+            autoComplete="off"
+            placeholder="Q14 or short prompt"
+          />
+        </label>
+        <label>
+          Correct answer
+          <input value={mqAnswer} onChange={(e) => setMqAnswer(e.target.value)} autoComplete="off" />
+        </label>
+        <label>
+          Commentary / notes
+          <textarea value={mqNotes} onChange={(e) => setMqNotes(e.target.value)} rows={2} />
+        </label>
+        <button type="submit" className="btn btn-primary">
+          Add missed question
+        </button>
+      </form>
+
+      {missed.length === 0 ? (
+        <p className="meta" style={{ marginTop: '1rem' }}>
+          No missed questions for this resource yet.
+        </p>
+      ) : (
+        <ul className="history-list" style={{ marginTop: '1rem' }}>
+          {missed.map((q) => (
+            <li key={q.id}>
+              <strong>
+                {q.sectionCode}: {q.prompt}
+              </strong>
+              <p className="meta">
+                Answer: {q.correctAnswer || '—'} · Confidence {q.confidence}/5
+                {q.inRotation ? '' : ' · removed from rotation'}
+              </p>
+              {q.commentary ? <p className="meta">{q.commentary}</p> : null}
+              <div className="btn-row">
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={async () => {
+                    await window.studyHub.setMissedQuestionInRotation(q.id, !q.inRotation)
+                    await reload()
+                    showStatus(q.inRotation ? 'Removed from flashcards.' : 'Added back to flashcards.')
+                  }}
+                >
+                  {q.inRotation ? 'Remove from flashcards' : 'Add to flashcards'}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-danger"
+                  onClick={async () => {
+                    if (!window.confirm('Delete this missed question?')) return
+                    await window.studyHub.deleteMissedQuestion(q.id)
+                    await reload()
+                    showStatus('Missed question deleted.')
+                  }}
+                >
+                  Delete
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="section-head" style={{ marginTop: '1.5rem' }}>
+        <div>
+          <h3>Flashcard review</h3>
+          <p className="meta">Questions still in rotation for this resource.</p>
+        </div>
+      </div>
+      {!flashCard ? (
+        <p className="meta">Nothing in rotation yet.</p>
+      ) : (
+        <div className="flashcard">
+          <p className="meta">
+            {flashIndex + 1} of {inRotation.length} · {flashCard.sectionCode}
+          </p>
+          <p className="queue-desc">{flashCard.prompt}</p>
+          {flashRevealed ? (
+            <>
+              <p>
+                <strong>Answer:</strong> {flashCard.correctAnswer || '—'}
+              </p>
+              {flashCard.commentary ? <p className="meta">{flashCard.commentary}</p> : null}
+              <p className="field-label">Confidence (1 shaky → 5 solid)</p>
+              <div className="btn-row">
+                {[1, 2, 3, 4, 5].map((n) => (
+                  <button
+                    key={n}
+                    type="button"
+                    className={`btn ${flashCard.confidence === n ? 'btn-primary' : 'btn-ghost'}`}
+                    onClick={async () => {
+                      await window.studyHub.setMissedQuestionConfidence(flashCard.id, n)
+                      await reload()
+                      showStatus(`Confidence set to ${n}.`)
+                    }}
+                  >
+                    {n}
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : (
+            <button type="button" className="btn btn-secondary" onClick={() => setFlashRevealed(true)}>
+              Show answer
+            </button>
+          )}
+          <div className="btn-row" style={{ marginTop: '0.75rem' }}>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              disabled={flashIndex <= 0}
+              onClick={() => {
+                setFlashIndex((i) => Math.max(0, i - 1))
+                setFlashRevealed(false)
+              }}
+            >
+              Previous
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              disabled={flashIndex >= inRotation.length - 1}
+              onClick={() => {
+                setFlashIndex((i) => Math.min(inRotation.length - 1, i + 1))
+                setFlashRevealed(false)
+              }}
+            >
+              Next
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={async () => {
+                await window.studyHub.setMissedQuestionInRotation(flashCard.id, false)
+                await reload()
+                setFlashIndex((i) => Math.min(i, Math.max(0, inRotation.length - 2)))
+                setFlashRevealed(false)
+                showStatus('Removed from flashcard rotation.')
+              }}
+            >
+              Remove from flashcards
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
   )
 }
 
@@ -1226,7 +1459,7 @@ function ProgressEditor({
       sectionId?: string
       sectionIds?: string[]
     },
-    schedule: NextActionSchedule
+    schedule: QueueScheduleValue
   ) => Promise<void>
 }) {
   const [config, setConfig] = useState(() => emptyProgressDraft(resource))
@@ -1238,13 +1471,7 @@ function ProgressEditor({
   const [formError, setFormError] = useState('')
   const [itemActions, setItemActions] = useState<Record<string, ItemSessionAction>>({})
   const [itemComments, setItemComments] = useState<Record<string, string>>({})
-  const [scheduleMode, setScheduleMode] = useState<'none' | 'today' | 'tomorrow' | 'date' | 'range'>('none')
-  const [pickDate, setPickDate] = useState(() => formatYmd(new Date()))
-  const [rangeEnd, setRangeEnd] = useState(() => {
-    const d = new Date()
-    d.setDate(d.getDate() + 1)
-    return formatYmd(d)
-  })
+  const [schedule, setSchedule] = useState<QueueScheduleValue>({ mode: 'none' })
   const [timestampText, setTimestampText] = useState('')
 
   const resetForm = () => {
@@ -1257,7 +1484,7 @@ function ProgressEditor({
     setItemComments({})
     setStopping('')
     setNextAction('')
-    setScheduleMode('none')
+    setSchedule({ mode: 'none' })
     setTimestampText('')
   }
 
@@ -1307,53 +1534,19 @@ function ProgressEditor({
     </>
   )
 
-  const buildSchedule = (): NextActionSchedule => {
-    if (scheduleMode === 'today') return { mode: 'today' }
-    if (scheduleMode === 'tomorrow') return { mode: 'tomorrow' }
-    if (scheduleMode === 'date') return { mode: 'date', startDate: pickDate }
-    if (scheduleMode === 'range') return { mode: 'range', startDate: pickDate, endDate: rangeEnd }
-    return { mode: 'none' }
-  }
-
   const queueToggles = (
     <div className="next-action-schedule">
       <p className="field-label">Next action — add to queue when you save</p>
-      <label>
-        When
-        <select
-          value={scheduleMode}
-          onChange={(e) =>
-            setScheduleMode(e.target.value as 'none' | 'today' | 'tomorrow' | 'date' | 'range')
-          }
-          name="next-action-when"
-        >
-          <option value="none">Don’t add to queue</option>
-          <option value="today">Today</option>
-          <option value="tomorrow">Tomorrow</option>
-          <option value="date">Pick a date</option>
-          <option value="range">Several days (date range)</option>
-        </select>
-      </label>
-      {(scheduleMode === 'date' || scheduleMode === 'range') && (
-        <label>
-          {scheduleMode === 'range' ? 'From date' : 'Date'}
-          <input type="date" value={pickDate} onChange={(e) => setPickDate(e.target.value)} required />
-        </label>
-      )}
-      {scheduleMode === 'range' && (
-        <label>
-          Through date
-          <input type="date" value={rangeEnd} onChange={(e) => setRangeEnd(e.target.value)} required />
-        </label>
-      )}
+      <QueueScheduleFields allowNone value={schedule} onChange={setSchedule} label="When" />
       <p className="meta" style={{ margin: '0.35rem 0 0' }}>
-        Needs a next action above. Chosen dates land on the Today queue tabs for those days.
+        Needs a next action above. Chosen dates land on the Today queue for those days. Completing one day only
+        finishes that day.
       </p>
     </div>
   )
 
   const histAreas = selectedAreaIds
-  const queueWhen = buildSchedule()
+  const queueWhen = schedule
 
   if (resource.type === 'textbook') {
     const c = config as TextbookConfig

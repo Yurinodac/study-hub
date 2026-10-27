@@ -51,6 +51,8 @@ export default function SettingsPanel({
     hasCustomImage: false,
     imageUrl: null
   })
+  const [testDate, setTestDate] = useState<string>('')
+  const [testDateDraft, setTestDateDraft] = useState('')
 
   // Missed-question draft
   const [mqSection, setMqSection] = useState<ExamSectionCode>('C/P')
@@ -85,6 +87,9 @@ export default function SettingsPanel({
       setPaths(await window.studyHub.getPaths())
       setRenameValue(current?.name ?? '')
       setCeleb(await window.studyHub.getCelebration())
+      const td = (await window.studyHub.getProjectTestDate(projectId)) ?? ''
+      setTestDate(td)
+      setTestDateDraft(td)
       await reloadExams()
     })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -101,6 +106,7 @@ export default function SettingsPanel({
             <p>Your progress is saved automatically on this computer. Export a backup before big changes.</p>
           </div>
         </div>
+
         <div className="btn-row">
           <button
             type="button"
@@ -512,7 +518,10 @@ export default function SettingsPanel({
           </div>
         </div>
         {!flashCard ? (
-          <p className="meta">No missed questions in rotation yet. Add some under a practice exam.</p>
+          <p className="meta">
+            No missed questions in rotation yet. Add some under a practice exam or on a question bank / Anki resource’s
+            Missed Q tab.
+          </p>
         ) : (
           <div className="flashcard">
             <p className="meta">
@@ -601,6 +610,34 @@ export default function SettingsPanel({
           </div>
         </div>
         <div className="form-grid">
+          <label>
+            Test date (optional — countdown lives on Today)
+            <input
+              type="date"
+              value={testDateDraft}
+              onChange={(e) => setTestDateDraft(e.target.value)}
+            />
+          </label>
+          <p className="meta" style={{ margin: 0 }}>
+            {testDate ? `Saved: ${testDate}. Primary countdown is on the Today page.` : 'Not set yet.'}
+          </p>
+          <div className="btn-row">
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={async () => {
+                const saved = await window.studyHub.setProjectTestDate(
+                  projectId,
+                  testDateDraft.trim() || null
+                )
+                setTestDate(saved ?? '')
+                setTestDateDraft(saved ?? '')
+                showStatus(saved ? `Test date saved: ${saved}` : 'Test date cleared.')
+              }}
+            >
+              Save test date
+            </button>
+          </div>
           <label>
             Rename current project
             <input value={renameValue} onChange={(e) => setRenameValue(e.target.value)} />
